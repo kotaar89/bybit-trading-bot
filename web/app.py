@@ -150,10 +150,11 @@ def get_standalone_client():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Главная страница дашборда."""
+    ctx = {"request": request, "symbols": config.SYMBOLS}
     try:
-        return templates.TemplateResponse(request=request, name="index.html")
+        return templates.TemplateResponse(request=request, name="index.html", context=ctx)
     except TypeError:
-        return templates.TemplateResponse("index.html", {"request": request})
+        return templates.TemplateResponse("index.html", ctx)
 
 
 @app.websocket("/ws")
@@ -316,6 +317,7 @@ async def get_status():
         "leverage": LEVERAGE,
         "open_positions_count": len(positions_data),
         "max_positions": MAX_OPEN_POSITIONS,
+        "symbols": config.SYMBOLS,
         "positions": positions_data
     }
 

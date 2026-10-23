@@ -165,11 +165,9 @@
                         <div class="flex items-center space-x-2">
                             <h3 class="text-sm font-bold uppercase tracking-wider text-slate-300">График свечей</h3>
                             <select id="chartSymbolSelect" onchange="loadCandleChart()" class="bg-slate-950 border border-slate-700 text-xs text-white rounded px-2.5 py-1 focus:outline-none">
-                                <option value="BTCUSDT">BTCUSDT</option>
-                                <option value="ETHUSDT">ETHUSDT</option>
-                                <option value="SOLUSDT">SOLUSDT</option>
-                                <option value="AVAXUSDT">AVAXUSDT</option>
-                                <option value="NEARUSDT">NEARUSDT</option>
+                                {% for sym in symbols|default(['ETHUSDT', 'SOLUSDT', 'AVAXUSDT', 'NEARUSDT']) %}
+                                <option value="{{ sym }}">{{ sym }}</option>
+                                {% endfor %}
                             </select>
                             <select id="chartIntervalSelect" onchange="loadCandleChart()" class="bg-slate-950 border border-slate-700 text-xs text-white rounded px-2.5 py-1 focus:outline-none">
                                 <option value="15">15m</option>
@@ -245,11 +243,9 @@
                         </label>
                         <select id="btSymbol" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500">
                             <option value="ALL">Вся корзина (ALL)</option>
-                            <option value="BTCUSDT" selected>BTCUSDT</option>
-                            <option value="ETHUSDT">ETHUSDT</option>
-                            <option value="SOLUSDT">SOLUSDT</option>
-                            <option value="AVAXUSDT">AVAXUSDT</option>
-                            <option value="NEARUSDT">NEARUSDT</option>
+                            {% for sym in symbols|default(['ETHUSDT', 'SOLUSDT', 'AVAXUSDT', 'NEARUSDT']) %}
+                            <option value="{{ sym }}">{{ sym }}</option>
+                            {% endfor %}
                         </select>
                     </div>
 
@@ -502,10 +498,34 @@
             cbStatus.innerText = "Защита: " + (data.circuit_breaker ? "АКТИВНА (Стоп)" : "Спящий");
             cbStatus.className = "text-xs mt-0.5 " + (data.circuit_breaker ? "text-rose-400 font-bold" : "text-emerald-400");
 
-            // 6. Positions Count
+            // 6. Positions Count & Dynamic Symbols List
             document.getElementById("activePosCount").innerText = `${data.open_positions_count} / ${data.max_positions}`;
             document.getElementById("posCountBadge").innerText = data.open_positions_count;
             document.getElementById("strategyInfo").innerText = `${data.strategy} (x${data.leverage})`;
+
+            if (Array.isArray(data.symbols) && data.symbols.length > 0) {
+                const chartSel = document.getElementById("chartSymbolSelect");
+                if (chartSel) {
+                    const currentOpts = Array.from(chartSel.options).map(o => o.value).join(",");
+                    if (currentOpts !== data.symbols.join(",")) {
+                        const prevVal = chartSel.value;
+                        chartSel.innerHTML = data.symbols.map(s => `<option value="${s}">${s}</option>`).join("");
+                        if (data.symbols.includes(prevVal)) chartSel.value = prevVal;
+                        loadCandleChart();
+                    }
+                }
+                const btSel = document.getElementById("btSymbol");
+                if (btSel) {
+                    const expectedBt = ["ALL", ...data.symbols].join(",");
+                    const currentBt = Array.from(btSel.options).map(o => o.value).join(",");
+                    if (currentBt !== expectedBt) {
+                        const prevBt = btSel.value;
+                        btSel.innerHTML = `<option value="ALL">Вся корзина (ALL)</option>` +
+                            data.symbols.map(s => `<option value="${s}">${s}</option>`).join("");
+                        if (prevBt === "ALL" || data.symbols.includes(prevBt)) btSel.value = prevBt;
+                    }
+                }
+            }
 
             // 7. Render Positions Table
             renderPositionsTable(data.positions || []);
