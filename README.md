@@ -1,4 +1,4 @@
-# Bybit Futures Multi-Pair Bot v2.0 (Termux & Server Ready)
+# Bybit Futures Multi-Pair Bot v2.2 (Termux & Server Ready)
 
 Алготрейдинг-бот для деривативов Bybit с адаптивным риск-менеджментом, встроенным веб-дашбордом на FastAPI и модулем оптимизации стратегий.
 
