@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Bybit Futures Bot v2.2 — Dashboard</title>
+    <!-- Tailwind CSS (CDN) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: { 850: '#151f32', 950: '#070c18' }
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- TradingView Lightweight Charts -->
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .pulse-dot { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-indigo-500 selection:text-white">
+
+    <!-- Top Header -->
+    <header class="bg-slate-900 border-b border-slate-800 sticky top-0 z-40 px-4 py-3 sm:px-6">
+        <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center space-x-3">
+                <div id="statusDot" class="w-3 h-3 rounded-full bg-emerald-500 pulse-dot"></div>
+                <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+                    Bybit Bot <span class="text-xs bg-indigo-600/60 text-indigo-300 border border-indigo-500/40 px-2 py-0.5 rounded-full font-mono">v2.2</span>
+                </h1>
+                <span id="modeBadge" class="text-xs font-semibold px-2.5 py-1 rounded border uppercase tracking-wider bg-amber-500/20 text-amber-300 border-amber-500/40">
+                    DEMO
+                </span>
+                <span id="wsStatusBadge" class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hidden sm:inline-block">
+                    WS LIVE
+                </span>
+            </div>
+
+            <!-- Tab Switcher -->
+            <div class="flex items-center space-x-2 bg-slate-950 p-1 rounded-lg border border-slate-800 text-sm">
+                <button id="tabOverviewBtn" onclick="switchTab('overview')" class="px-3 py-1.5 rounded-md font-medium transition bg-indigo-600 text-white shadow">
+                    Мониторинг
+                </button>
+                <button id="tabBacktestBtn" onclick="switchTab('backtest')" class="px-3 py-1.5 rounded-md font-medium transition text-slate-400 hover:text-white">
+                    Бэктест
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-6">
+
+        <!-- ======================= TAB: OVERVIEW ======================= -->
+        <section id="tabOverview" class="space-y-6">
+
+            <!-- Control Bar (Emergency & Action Buttons) -->
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+                <div class="flex items-center space-x-3">
+                    <span class="text-sm font-medium text-slate-400">Состояние бота:</span>
+                    <span id="botStateText" class="text-sm font-semibold text-emerald-400">АКТИВЕН</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-2.5">
+                    <button id="pauseBtn" onclick="togglePause()" class="px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white transition flex items-center gap-1.5 shadow">
+                        <span>⏸</span> <span>Пауза</span>
+                    </button>
+
+                    <button onclick="openPanicModal()" class="px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-rose-700 hover:bg-rose-600 text-white transition flex items-center gap-1.5 shadow">
+                        <span>🛑</span> <span>PANIC: Закрыть всё</span>
+                    </button>
+
+                    <a href="/api/logs/download?file=trade" download="trade.log" class="px-3 py-2 text-xs sm:text-sm font-medium rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition inline-flex items-center gap-1.5">
+                        <span>📥</span> <span>Логи Trade</span>
+                    </a>
+
+                    <a href="/api/logs/download?file=bot" download="bot.log" class="px-3 py-2 text-xs sm:text-sm font-medium rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition inline-flex items-center gap-1.5">
+                        <span>📥</span> <span>Логи Bot</span>
+                    </a>
+
+                    <button onclick="openModeModal()" class="px-3 py-2 text-xs sm:text-sm font-medium rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition">
+                        Сменить режим
+                    </button>
+                </div>
+            </div>
+
+            <!-- KPI Cards Grid -->
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+                <!-- Balance & Equity -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 relative overflow-hidden">
+                    <div class="text-xs uppercase font-medium text-slate-400">Баланс / Equity</div>
+                    <div id="walletBalance" class="text-xl sm:text-2xl font-bold text-white mt-1">-- USDT</div>
+                    <div id="equityBalance" class="text-xs text-slate-400 mt-0.5">Equity: -- USDT</div>
+                </div>
+
+                <!-- Unrealized PnL -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 relative overflow-hidden">
+                    <div class="text-xs uppercase font-medium text-slate-400">Нереализованный PnL</div>
+                    <div id="unrealizedPnl" class="text-xl sm:text-2xl font-bold text-slate-300 mt-1">-- $</div>
+                    <div id="unrealizedPnlPct" class="text-xs text-slate-400 mt-0.5">-- %</div>
+                </div>
+
+                <!-- Daily PnL & Circuit Breaker -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 relative overflow-hidden">
+                    <div class="text-xs uppercase font-medium text-slate-400">Дневной PnL</div>
+                    <div id="dailyPnl" class="text-xl sm:text-2xl font-bold text-slate-300 mt-1">-- $</div>
+                    <div id="circuitBreakerStatus" class="text-xs text-emerald-400 mt-0.5">Защита: Спящий</div>
+                </div>
+
+                <!-- Positions Count & Strategy -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 relative overflow-hidden">
+                    <div class="text-xs uppercase font-medium text-slate-400">Позиции / Стратегия</div>
+                    <div id="activePosCount" class="text-xl sm:text-2xl font-bold text-white mt-1">0 / 3</div>
+                    <div id="strategyInfo" class="text-xs text-indigo-400 mt-0.5">MA_RSI (x5)</div>
+                </div>
+            </div>
+
+            <!-- Active Positions Table -->
+            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                        <span>Открытые позиции</span>
+                        <span id="posCountBadge" class="bg-slate-800 text-slate-400 text-xs px-2 py-0.5 rounded-full">0</span>
+                    </h2>
+                    <button onclick="refreshData()" class="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+                        <span>↻</span> <span>Обновить</span>
+                    </button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-xs sm:text-sm">
+                        <thead class="bg-slate-950/60 text-slate-400 uppercase text-[11px] border-b border-slate-800">
+                            <tr>
+                                <th class="px-4 py-3 font-semibold">Символ</th>
+                                <th class="px-4 py-3 font-semibold">Направление</th>
+                                <th class="px-4 py-3 font-semibold">Объем</th>
+                                <th class="px-4 py-3 font-semibold">Вход / Текущая</th>
+                                <th class="px-4 py-3 font-semibold">SL / TP</th>
+                                <th class="px-4 py-3 font-semibold">PnL ($ / %)</th>
+                                <th class="px-4 py-3 text-right font-semibold">Действие</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positionsTableBody" class="divide-y divide-slate-800/60">
+                            <tr>
+                                <td colspan="7" class="px-4 py-8 text-center text-slate-500">
+                                    Нет открытых позиций
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Interactive Charts Section: Candlestick & Equity Curve -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <!-- Candlestick Chart -->
+                <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3 shadow">
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                        <div class="flex items-center space-x-2">
+                            <h3 class="text-sm font-bold uppercase tracking-wider text-slate-300">График свечей</h3>
+                            <select id="chartSymbolSelect" onchange="loadCandleChart()" class="bg-slate-950 border border-slate-700 text-xs text-white rounded px-2.5 py-1 focus:outline-none">
+                                <option value="BTCUSDT">BTCUSDT</option>
+                                <option value="ETHUSDT">ETHUSDT</option>
+                                <option value="SOLUSDT">SOLUSDT</option>
+                                <option value="AVAXUSDT">AVAXUSDT</option>
+                                <option value="NEARUSDT">NEARUSDT</option>
+                            </select>
+                            <select id="chartIntervalSelect" onchange="loadCandleChart()" class="bg-slate-950 border border-slate-700 text-xs text-white rounded px-2.5 py-1 focus:outline-none">
+                                <option value="15">15m</option>
+                                <option value="60" selected>1h</option>
+                                <option value="240">4h</option>
+                                <option value="D">1D</option>
+                            </select>
+                        </div>
+                        <div id="chartLegend" class="flex items-center gap-3 text-[11px] text-slate-400">
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-blue-500"></span> Вход</span>
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-rose-500"></span> SL</span>
+                            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500"></span> TP</span>
+                        </div>
+                    </div>
+                    <div id="candlestickChartContainer" class="w-full h-72 sm:h-80 rounded-lg overflow-hidden bg-slate-950"></div>
+                </div>
+
+                <!-- Equity Curve Chart -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3 shadow">
+                    <div class="flex items-center justify-between">
+                        <h3 class="text-sm font-bold uppercase tracking-wider text-slate-300">Кривая капитала (Equity)</h3>
+                        <button onclick="loadEquityChart()" class="text-xs text-indigo-400 hover:text-indigo-300">↻</button>
+                    </div>
+                    <div id="equityChartContainer" class="w-full h-72 sm:h-80 rounded-lg overflow-hidden bg-slate-950"></div>
+                </div>
+            </div>
+
+            <!-- Recent Trades Log -->
+            <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow">
+                <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
+                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">
+                        Последние сделки (trade.log)
+                    </h2>
+                    <span class="text-xs text-slate-500">Лимит: 40</span>
+                </div>
+                <div class="overflow-x-auto max-h-80 overflow-y-auto">
+                    <table class="w-full text-left text-xs">
+                        <thead class="bg-slate-950/60 text-slate-400 uppercase text-[10px] border-b border-slate-800 sticky top-0">
+                            <tr>
+                                <th class="px-3 py-2 font-semibold">Время (UTC)</th>
+                                <th class="px-3 py-2 font-semibold">Пара</th>
+                                <th class="px-3 py-2 font-semibold">Событие</th>
+                                <th class="px-3 py-2 font-semibold">Цена</th>
+                                <th class="px-3 py-2 font-semibold">PnL</th>
+                                <th class="px-3 py-2 font-semibold">Детали</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tradesTableBody" class="divide-y divide-slate-800/40">
+                            <tr><td colspan="6" class="px-3 py-4 text-center text-slate-500">Загрузка логов...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+        </section>
+
+        <!-- ======================= TAB: BACKTEST ======================= -->
+        <section id="tabBacktest" class="space-y-6 hidden">
+
+            <!-- Backtest Setup Card -->
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow space-y-4">
+                <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                    <h2 class="text-base font-bold text-white flex items-center gap-2">
+                        <span>🧪 Симулятор бэктестинга стратегии v2.1</span>
+                    </h2>
+                    <span class="text-xs text-slate-400">Параметры из config.py</span>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                            Торговая пара
+                        </label>
+                        <select id="btSymbol" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+                            <option value="ALL">Вся корзина (ALL)</option>
+                            <option value="BTCUSDT" selected>BTCUSDT</option>
+                            <option value="ETHUSDT">ETHUSDT</option>
+                            <option value="SOLUSDT">SOLUSDT</option>
+                            <option value="AVAXUSDT">AVAXUSDT</option>
+                            <option value="NEARUSDT">NEARUSDT</option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">
+                            Период тестирования (дней)
+                        </label>
+                        <input type="number" id="btDays" value="90" min="5" max="365" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500">
+                    </div>
+
+                    <div class="flex items-end">
+                        <button id="runBacktestBtn" onclick="runBacktest()" class="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-500 font-bold rounded-lg text-sm text-white transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30">
+                            <span id="btSpinner" class="hidden animate-spin">⏳</span>
+                            <span>Запустить бэктест</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Backtest Results Card -->
+            <div id="btResultsCard" class="hidden space-y-6">
+                <!-- Summary Metrics -->
+                <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-center">
+                        <div class="text-xs text-slate-400 font-medium uppercase">Итоговый PnL</div>
+                        <div id="btResPnl" class="text-lg sm:text-xl font-bold mt-1">--</div>
+                    </div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-center">
+                        <div class="text-xs text-slate-400 font-medium uppercase">Win Rate</div>
+                        <div id="btResWinRate" class="text-lg sm:text-xl font-bold mt-1 text-white">--</div>
+                    </div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-center">
+                        <div class="text-xs text-slate-400 font-medium uppercase">Profit Factor</div>
+                        <div id="btResPF" class="text-lg sm:text-xl font-bold mt-1 text-white">--</div>
+                    </div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-center">
+                        <div class="text-xs text-slate-400 font-medium uppercase">Макс. просадка</div>
+                        <div id="btResMaxDD" class="text-lg sm:text-xl font-bold mt-1 text-rose-400">--</div>
+                    </div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-center">
+                        <div class="text-xs text-slate-400 font-medium uppercase">Коэфф. Шарпа</div>
+                        <div id="btResSharpe" class="text-lg sm:text-xl font-bold mt-1 text-white">--</div>
+                    </div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-center">
+                        <div class="text-xs text-slate-400 font-medium uppercase">Всего сделок</div>
+                        <div id="btResTrades" class="text-lg sm:text-xl font-bold mt-1 text-white">0</div>
+                    </div>
+                </div>
+
+                <!-- Backtest Trades Table -->
+                <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow">
+                    <div class="px-4 py-3 border-b border-slate-800">
+                        <h3 class="text-sm font-bold uppercase tracking-wider text-slate-300">Сводка по сделкам</h3>
+                    </div>
+                    <div class="overflow-x-auto max-h-96 overflow-y-auto">
+                        <table class="w-full text-left text-xs">
+                            <thead class="bg-slate-950/60 text-slate-400 uppercase border-b border-slate-800 sticky top-0">
+                                <tr>
+                                    <th class="px-3 py-2 font-semibold">Пара</th>
+                                    <th class="px-3 py-2 font-semibold">Тип</th>
+                                    <th class="px-3 py-2 font-semibold">Вход</th>
+                                    <th class="px-3 py-2 font-semibold">Выход</th>
+                                    <th class="px-3 py-2 font-semibold">PnL %</th>
+                                    <th class="px-3 py-2 font-semibold">Причина</th>
+                                    <th class="px-3 py-2 font-semibold">Дата</th>
+                                </tr>
+                            </thead>
+                            <tbody id="btTradesTableBody" class="divide-y divide-slate-800/40"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </section>
+
+    </main>
+
+    <!-- Modal: Panic Confirmation -->
+    <div id="panicModal" class="fixed inset-0 bg-black/75 z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-rose-600/50 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div class="text-rose-500 text-3xl">⚠️</div>
+            <h3 class="text-lg font-bold text-white">Экстренное закрытие всех позиций?</h3>
+            <p class="text-xs text-slate-400">
+                Будут отправлены маркет-ордера на немедленное закрытие всех активных позиций по всем парам и отменены все связанные лимитные и стоп-ордера.
+            </p>
+            <div class="flex items-center justify-end space-x-3 pt-2">
+                <button onclick="closePanicModal()" class="px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700">
+                    Отмена
+                </button>
+                <button onclick="executePanic()" class="px-4 py-2 text-xs font-semibold rounded-lg bg-rose-600 hover:bg-rose-500 text-white shadow">
+                    Подтвердить и закрыть всё
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal: Mode Change Confirmation with Password Protection -->
+    <div id="modeModal" class="fixed inset-0 bg-black/75 z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <h3 class="text-lg font-bold text-white">Переключение торгового режима</h3>
+            <p class="text-xs text-slate-400">
+                Выберите желаемый режим торговли. Внимание: режим <span class="text-rose-400 font-bold">LIVE</span> торгует на реальные средства!
+            </p>
+            <div id="modeButtonsRow" class="flex items-center space-x-3">
+                <button onclick="setTradingMode('DEMO')" class="flex-1 py-3 px-4 rounded-lg bg-amber-500/20 border border-amber-500/50 text-amber-300 font-bold text-sm hover:bg-amber-500/30">
+                    DEMO
+                </button>
+                <button onclick="showLiveConfirmation()" class="flex-1 py-3 px-4 rounded-lg bg-rose-500/20 border border-rose-500/50 text-rose-300 font-bold text-sm hover:bg-rose-500/30">
+                    LIVE (Боевой)
+                </button>
+            </div>
+
+            <!-- Password field for LIVE confirmation -->
+            <div id="livePasswordSection" class="hidden space-y-3 border-t border-slate-800 pt-3">
+                <div class="text-xs text-rose-400 font-semibold">⚠️ Введите пароль дашборда для перехода в LIVE:</div>
+                <input type="password" id="livePasswordInput" placeholder="Пароль дашборда" class="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white text-xs focus:outline-none focus:border-rose-500" />
+                <div class="flex items-center justify-end space-x-2">
+                    <button onclick="hideLiveConfirmation()" class="px-3 py-1.5 text-xs text-slate-400 hover:text-white">Отмена</button>
+                    <button onclick="confirmLiveMode()" class="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-lg shadow">Активировать LIVE</button>
+                </div>
+            </div>
+
+            <div class="text-right pt-2" id="modeModalCloseBtn">
+                <button onclick="closeModeModal()" class="px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 text-slate-400 hover:bg-slate-700">
+                    Закрыть
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript Logic -->
+    <script>
+        let latestStatusData = null;
+        let candleChart = null;
+        let candleSeries = null;
+        let equityChart = null;
+        let equitySeries = null;
+        let priceLines = [];
+
+        function switchTab(tab) {
+            const overview = document.getElementById("tabOverview");
+            const backtest = document.getElementById("tabBacktest");
+            const btnOver = document.getElementById("tabOverviewBtn");
+            const btnBack = document.getElementById("tabBacktestBtn");
+
+            if (tab === "overview") {
+                overview.classList.remove("hidden");
+                backtest.classList.add("hidden");
+                btnOver.className = "px-3 py-1.5 rounded-md font-medium transition bg-indigo-600 text-white shadow";
+                btnBack.className = "px-3 py-1.5 rounded-md font-medium transition text-slate-400 hover:text-white";
+                // Resize charts if needed
+                setTimeout(() => {
+                    if (candleChart) candleChart.timeScale().fitContent();
+                    if (equityChart) equityChart.timeScale().fitContent();
+                }, 100);
+            } else {
+                overview.classList.add("hidden");
+                backtest.classList.remove("hidden");
+                btnBack.className = "px-3 py-1.5 rounded-md font-medium transition bg-indigo-600 text-white shadow";
+                btnOver.className = "px-3 py-1.5 rounded-md font-medium transition text-slate-400 hover:text-white";
+            }
+        }
+
+        function openPanicModal() { document.getElementById("panicModal").classList.remove("hidden"); }
+        function closePanicModal() { document.getElementById("panicModal").classList.add("hidden"); }
+        function openModeModal() {
+            hideLiveConfirmation();
+            document.getElementById("modeModal").classList.remove("hidden");
+        }
+        function closeModeModal() { document.getElementById("modeModal").classList.add("hidden"); }
+
+        function showLiveConfirmation() {
+            document.getElementById("livePasswordSection").classList.remove("hidden");
+            document.getElementById("livePasswordInput").focus();
+        }
+
+        function hideLiveConfirmation() {
+            document.getElementById("livePasswordSection").classList.add("hidden");
+            document.getElementById("livePasswordInput").value = "";
+        }
+
+        async function confirmLiveMode() {
+            const pwd = document.getElementById("livePasswordInput").value;
+            await setTradingMode('LIVE', pwd);
+        }
+
+        // ======================= DASHBOARD DATA & WS =======================
+
+        function updateDashboardUI(data) {
+            if (!data) return;
+            latestStatusData = data;
+
+            // 1. Mode Badge
+            const modeBadge = document.getElementById("modeBadge");
+            modeBadge.innerText = data.mode;
+            if (data.mode === "LIVE") {
+                modeBadge.className = "text-xs font-semibold px-2.5 py-1 rounded border uppercase tracking-wider bg-rose-500/20 text-rose-300 border-rose-500/40";
+            } else {
+                modeBadge.className = "text-xs font-semibold px-2.5 py-1 rounded border uppercase tracking-wider bg-amber-500/20 text-amber-300 border-amber-500/40";
+            }
+
+            // 2. Pause & Status State
+            const stateText = document.getElementById("botStateText");
+            const pauseBtn = document.getElementById("pauseBtn");
+            const dot = document.getElementById("statusDot");
+
+            if (data.is_paused) {
+                stateText.innerText = "ПАУЗА";
+                stateText.className = "text-sm font-semibold text-amber-400";
+                pauseBtn.className = "px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition flex items-center gap-1.5 shadow";
+                pauseBtn.innerHTML = `<span>▶</span> <span>Возобновить</span>`;
+                dot.className = "w-3 h-3 rounded-full bg-amber-500";
+            } else {
+                stateText.innerText = "АКТИВЕН";
+                stateText.className = "text-sm font-semibold text-emerald-400";
+                pauseBtn.className = "px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white transition flex items-center gap-1.5 shadow";
+                pauseBtn.innerHTML = `<span>⏸</span> <span>Пауза</span>`;
+                dot.className = "w-3 h-3 rounded-full bg-emerald-500 pulse-dot";
+            }
+
+            // 3. Balance & Equity
+            document.getElementById("walletBalance").innerText = data.balance.toFixed(2) + " USDT";
+            document.getElementById("equityBalance").innerText = "Equity: " + data.equity.toFixed(2) + " USDT";
+
+            // 4. Unrealized PnL
+            const uPnl = document.getElementById("unrealizedPnl");
+            const uPnlPct = document.getElementById("unrealizedPnlPct");
+            const sign = data.unrealized_pnl >= 0 ? "+" : "";
+            uPnl.innerText = sign + data.unrealized_pnl.toFixed(2) + " $";
+            uPnlPct.innerText = sign + data.unrealized_pnl_pct.toFixed(2) + " %";
+
+            if (data.unrealized_pnl > 0) {
+                uPnl.className = "text-xl sm:text-2xl font-bold text-emerald-400 mt-1";
+                uPnlPct.className = "text-xs text-emerald-400 mt-0.5";
+            } else if (data.unrealized_pnl < 0) {
+                uPnl.className = "text-xl sm:text-2xl font-bold text-rose-400 mt-1";
+                uPnlPct.className = "text-xs text-rose-400 mt-0.5";
+            } else {
+                uPnl.className = "text-xl sm:text-2xl font-bold text-slate-300 mt-1";
+                uPnlPct.className = "text-xs text-slate-400 mt-0.5";
+            }
+
+            // 5. Daily PnL & Circuit Breaker
+            const dPnl = document.getElementById("dailyPnl");
+            const dSign = data.daily_pnl >= 0 ? "+" : "";
+            dPnl.innerText = dSign + data.daily_pnl.toFixed(2) + " $";
+            dPnl.className = "text-xl sm:text-2xl font-bold mt-1 " + (data.daily_pnl >= 0 ? "text-emerald-400" : "text-rose-400");
+
+            const cbStatus = document.getElementById("circuitBreakerStatus");
+            cbStatus.innerText = "Защита: " + (data.circuit_breaker ? "АКТИВНА (Стоп)" : "Спящий");
+            cbStatus.className = "text-xs mt-0.5 " + (data.circuit_breaker ? "text-rose-400 font-bold" : "text-emerald-400");
+
+            // 6. Positions Count
+            document.getElementById("activePosCount").innerText = `${data.open_positions_count} / ${data.max_positions}`;
+            document.getElementById("posCountBadge").innerText = data.open_positions_count;
+            document.getElementById("strategyInfo").innerText = `${data.strategy} (x${data.leverage})`;
+
+            // 7. Render Positions Table
+            renderPositionsTable(data.positions || []);
+
+            // 8. Update Chart Markers if active position matches selected chart symbol
+            updateChartPriceLines();
+        }
+
+        function renderPositionsTable(positions) {
+            const tbody = document.getElementById("positionsTableBody");
+            if (!positions || positions.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">Нет открытых позиций</td></tr>`;
+                return;
+            }
+
+            let html = "";
+            for (const p of positions) {
+                const isLong = p.side.toLowerCase() === "buy" || p.side.toLowerCase() === "long";
+                const sideBadge = isLong
+                    ? `<span class="bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 px-2 py-0.5 rounded font-bold uppercase text-[11px]">LONG</span>`
+                    : `<span class="bg-rose-500/20 text-rose-400 border border-rose-500/40 px-2 py-0.5 rounded font-bold uppercase text-[11px]">SHORT</span>`;
+
+                const pnlSign = p.pnl >= 0 ? "+" : "";
+                const pnlColor = p.pnl >= 0 ? "text-emerald-400" : "text-rose-400";
+                const beStatus = p.breakeven ? `<span class="text-[10px] bg-slate-800 text-emerald-400 px-1.5 py-0.5 rounded ml-1">Б/У</span>` : "";
+
+                html += `
+                    <tr class="hover:bg-slate-850/60 transition">
+                        <td class="px-4 py-3 font-bold text-white">${p.symbol}</td>
+                        <td class="px-4 py-3">${sideBadge}</td>
+                        <td class="px-4 py-3 font-mono">${p.size}</td>
+                        <td class="px-4 py-3 font-mono">
+                            <div>${p.entry_price}</div>
+                            <div class="text-[11px] text-slate-400">Mark: ${p.mark_price}</div>
+                        </td>
+                        <td class="px-4 py-3 font-mono text-xs">
+                            <div class="text-rose-400">SL: ${p.stop_loss || "--"}${beStatus}</div>
+                            <div class="text-emerald-400">TP: ${p.take_profit || "--"}</div>
+                        </td>
+                        <td class="px-4 py-3 font-mono font-bold ${pnlColor}">
+                            <div>${pnlSign}${p.pnl.toFixed(2)} $</div>
+                            <div class="text-xs font-normal">${pnlSign}${p.pnl_pct.toFixed(2)} %</div>
+                        </td>
+                        <td class="px-4 py-3 text-right">
+                            <button onclick="closeSinglePosition('${p.symbol}')" class="px-3 py-1 bg-rose-600/20 hover:bg-rose-600 border border-rose-500/40 hover:border-transparent text-rose-300 hover:text-white rounded text-xs font-medium transition">
+                                Закрыть
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }
+            tbody.innerHTML = html;
+        }
+
+        async function refreshData() {
+            try {
+                const res = await fetch("/api/status");
+                if (res.ok) {
+                    const data = await res.json();
+                    updateDashboardUI(data);
+                }
+            } catch (err) {
+                console.error("Ошибка обновления статуса:", err);
+            }
+        }
+
+        async function refreshTradesLog() {
+            try {
+                const res = await fetch("/api/trades");
+                if (!res.ok) return;
+                const trades = await res.json();
+                const tbody = document.getElementById("tradesTableBody");
+
+                if (!trades || trades.length === 0) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="px-3 py-4 text-center text-slate-500">Сделок пока нет</td></tr>`;
+                    return;
+                }
+
+                let html = "";
+                for (const t of trades) {
+                    const pnlVal = typeof t.pnl_pct === "number" ? t.pnl_pct : 0;
+                    const pnlColor = pnlVal > 0 ? "text-emerald-400" : (pnlVal < 0 ? "text-rose-400" : "text-slate-400");
+                    const pnlText = pnlVal !== 0 ? (pnlVal > 0 ? "+" : "") + pnlVal.toFixed(2) + "%" : (t.pnl || "--");
+
+                    html += `
+                        <tr class="hover:bg-slate-850/40">
+                            <td class="px-3 py-2 text-slate-400 font-mono">${t.time || t.timestamp || "--"}</td>
+                            <td class="px-3 py-2 font-bold text-white">${t.symbol || "--"}</td>
+                            <td class="px-3 py-2">${t.event || t.action || "--"}</td>
+                            <td class="px-3 py-2 font-mono">${t.price || "--"}</td>
+                            <td class="px-3 py-2 font-mono font-bold ${pnlColor}">${pnlText}</td>
+                            <td class="px-3 py-2 text-slate-400 truncate max-w-xs">${t.raw || t.details || ""}</td>
+                        </tr>
+                    `;
+                }
+                tbody.innerHTML = html;
+            } catch (err) {
+                console.error("Ошибка загрузки логов:", err);
+            }
+        }
+
+        // ======================= WEBSOCKET STREAM =======================
+
+        let ws = null;
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            try {
+                ws = new WebSocket(wsUrl);
+                ws.onopen = () => {
+                    const b = document.getElementById("wsStatusBadge");
+                    if (b) { b.innerText = "WS LIVE"; b.className = "text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"; }
+                };
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        updateDashboardUI(data);
+                    } catch (e) {
+                        console.error("WS parse error", e);
+                    }
+                };
+                ws.onclose = () => {
+                    const b = document.getElementById("wsStatusBadge");
+                    if (b) { b.innerText = "WS RECONNECT"; b.className = "text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20"; }
+                    setTimeout(initWebSocket, 3000);
+                };
+                ws.onerror = () => {
+                    if (ws) ws.close();
+                };
+            } catch (e) {
+                console.warn("WebSocket init error, fallback to poll", e);
+            }
+        }
+
+        // ======================= ACTIONS =======================
+
+        async function togglePause() {
+            try {
+                const res = await fetch("/api/pause", { method: "POST" });
+                const d = await res.json();
+                refreshData();
+            } catch (err) {
+                alert("Ошибка паузы: " + err);
+            }
+        }
+
+        async function executePanic() {
+            try {
+                closePanicModal();
+                const res = await fetch("/api/panic", { method: "POST" });
+                const d = await res.json();
+                alert(d.message || "Команда Panic выполнена");
+                refreshData();
+            } catch (err) {
+                alert("Ошибка выполнения Panic: " + err);
+            }
+        }
+
+        async function closeSinglePosition(symbol) {
+            if (!confirm(`Закрыть позицию по ${symbol} по рынку?`)) return;
+            try {
+                const res = await fetch(`/api/close_position?symbol=${symbol}`, { method: "POST" });
+                const d = await res.json();
+                alert(d.message || "Позиция закрыта");
+                refreshData();
+            } catch (err) {
+                alert("Ошибка закрытия позиции: " + err);
+            }
+        }
+
+        async function setTradingMode(mode, password = null) {
+            try {
+                let url = `/api/set_mode?mode=${mode}`;
+                if (password) {
+                    url += `&password=${encodeURIComponent(password)}`;
+                }
+                const res = await fetch(url, { method: "POST" });
+                const d = await res.json();
+                if (!res.ok) {
+                    alert(d.detail || d.message || "Ошибка переключения режима");
+                    return;
+                }
+                closeModeModal();
+                alert(d.message || "Режим успешно изменен");
+                refreshData();
+            } catch (err) {
+                alert("Ошибка переключения режима: " + err);
+            }
+        }
+
+        // ======================= CHARTS (TradingView Lightweight) =======================
+
+        function initCharts() {
+            const candleContainer = document.getElementById("candlestickChartContainer");
+            if (candleContainer && window.LightweightCharts) {
+                candleChart = LightweightCharts.createChart(candleContainer, {
+                    layout: { background: { color: '#070c18' }, textColor: '#94a3b8' },
+                    grid: { vertLines: { color: '#151f32' }, horzLines: { color: '#151f32' } },
+                    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                    timeScale: { borderColor: '#1e293b', timeVisible: true, secondsVisible: false }
+                });
+                candleSeries = candleChart.addCandlestickSeries({
+                    upColor: '#10b981', downColor: '#f43f5e',
+                    borderUpColor: '#10b981', borderDownColor: '#f43f5e',
+                    wickUpColor: '#10b981', wickDownColor: '#f43f5e'
+                });
+                loadCandleChart();
+            }
+
+            const equityContainer = document.getElementById("equityChartContainer");
+            if (equityContainer && window.LightweightCharts) {
+                equityChart = LightweightCharts.createChart(equityContainer, {
+                    layout: { background: { color: '#070c18' }, textColor: '#94a3b8' },
+                    grid: { vertLines: { color: '#151f32' }, horzLines: { color: '#151f32' } },
+                    timeScale: { borderColor: '#1e293b', timeVisible: true, secondsVisible: false }
+                });
+                equitySeries = equityChart.addAreaSeries({
+                    topColor: 'rgba(99, 102, 241, 0.4)',
+                    bottomColor: 'rgba(99, 102, 241, 0.02)',
+                    lineColor: '#6366f1',
+                    lineWidth: 2
+                });
+                loadEquityChart();
+            }
+
+            window.addEventListener('resize', () => {
+                if (candleChart && candleContainer) candleChart.applyOptions({ width: candleContainer.clientWidth });
+                if (equityChart && equityContainer) equityChart.applyOptions({ width: equityContainer.clientWidth });
+            });
+        }
+
+        async function loadCandleChart() {
+            if (!candleSeries) return;
+            const sym = document.getElementById("chartSymbolSelect").value;
+            const tf = document.getElementById("chartIntervalSelect").value;
+            try {
+                const res = await fetch(`/api/candles?symbol=${sym}&interval=${tf}&limit=120`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.length > 0) {
+                        candleSeries.setData(data);
+                        candleChart.timeScale().fitContent();
+                        updateChartPriceLines();
+                    }
+                }
+            } catch (err) {
+                console.error("Ошибка загрузки свечей:", err);
+            }
+        }
+
+        function updateChartPriceLines() {
+            if (!candleSeries || !latestStatusData) return;
+            const sym = document.getElementById("chartSymbolSelect").value;
+            // Remove existing lines
+            for (const line of priceLines) {
+                candleSeries.removePriceLine(line);
+            }
+            priceLines = [];
+
+            const pos = (latestStatusData.positions || []).find(p => p.symbol === sym);
+            if (pos) {
+                if (pos.entry_price > 0) {
+                    priceLines.push(candleSeries.createPriceLine({
+                        price: pos.entry_price,
+                        color: '#3b82f6',
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.Dashed,
+                        axisLabelVisible: true,
+                        title: 'ENTRY'
+                    }));
+                }
+                if (pos.stop_loss > 0) {
+                    priceLines.push(candleSeries.createPriceLine({
+                        price: pos.stop_loss,
+                        color: '#f43f5e',
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true,
+                        title: 'SL'
+                    }));
+                }
+                if (pos.take_profit > 0) {
+                    priceLines.push(candleSeries.createPriceLine({
+                        price: pos.take_profit,
+                        color: '#10b981',
+                        lineWidth: 2,
+                        lineStyle: LightweightCharts.LineStyle.Solid,
+                        axisLabelVisible: true,
+                        title: 'TP'
+                    }));
+                }
+            }
+        }
+
+        async function loadEquityChart() {
+            if (!equitySeries) return;
+            try {
+                const res = await fetch("/api/equity_history");
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.length > 0) {
+                        equitySeries.setData(data);
+                        equityChart.timeScale().fitContent();
+                    }
+                }
+            } catch (err) {
+                console.error("Ошибка загрузки кривой equity:", err);
+            }
+        }
+
+        // ======================= BACKTEST =======================
+
+        async function runBacktest() {
+            const sym = document.getElementById("btSymbol").value;
+            const days = parseInt(document.getElementById("btDays").value) || 90;
+            const btn = document.getElementById("runBacktestBtn");
+            const spinner = document.getElementById("btSpinner");
+
+            btn.disabled = true;
+            spinner.classList.remove("hidden");
+
+            try {
+                const res = await fetch("/api/backtest", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ symbol: sym, days: days })
+                });
+
+                if (!res.ok) {
+                    const errData = await res.json().catch(() => ({}));
+                    throw new Error(errData.message || "Ошибка запуска бэктеста");
+                }
+                const data = await res.json();
+
+                document.getElementById("btResultsCard").classList.remove("hidden");
+                const pnlEl = document.getElementById("btResPnl");
+                pnlEl.innerText = (data.pnl_pct >= 0 ? "+" : "") + data.pnl_pct.toFixed(2) + "%";
+                pnlEl.className = "text-lg sm:text-xl font-bold mt-1 " + (data.pnl_pct >= 0 ? "text-emerald-400" : "text-rose-400");
+
+                document.getElementById("btResWinRate").innerText = data.win_rate.toFixed(1) + "%";
+                document.getElementById("btResPF").innerText = data.profit_factor.toFixed(2);
+                document.getElementById("btResMaxDD").innerText = data.max_drawdown.toFixed(2) + "%";
+                document.getElementById("btResSharpe").innerText = data.sharpe_ratio.toFixed(2);
+                document.getElementById("btResTrades").innerText = data.trades;
+
+                const tbody = document.getElementById("btTradesTableBody");
+                let html = "";
+                if (data.recent_trades && data.recent_trades.length > 0) {
+                    for (const t of data.recent_trades) {
+                        const pnlColor = t.pnl_pct >= 0 ? "text-emerald-400" : "text-rose-400";
+                        const fmtP = (v) => (v < 1 ? v.toFixed(6) : (v < 100 ? v.toFixed(4) : v.toFixed(2)));
+                        html += `
+                            <tr class="hover:bg-slate-800/40">
+                                <td class="px-3 py-2 font-bold text-white">${t.symbol}</td>
+                                <td class="px-3 py-2 uppercase font-semibold text-slate-300">${t.type}</td>
+                                <td class="px-3 py-2 font-mono">${fmtP(t.entry)}</td>
+                                <td class="px-3 py-2 font-mono">${fmtP(t.exit)}</td>
+                                <td class="px-3 py-2 font-mono font-bold ${pnlColor}">${t.pnl_pct >= 0 ? "+" : ""}${t.pnl_pct.toFixed(2)}%</td>
+                                <td class="px-3 py-2 text-slate-400">${t.reason}</td>
+                                <td class="px-3 py-2 font-mono text-slate-400 text-[11px]">${t.exit_time || ""}</td>
+                            </tr>
+                        `;
+                    }
+                } else {
+                    html = `<tr><td colspan="7" class="px-3 py-4 text-center text-slate-500">Сделок нет</td></tr>`;
+                }
+                tbody.innerHTML = html;
+
+            } catch (err) {
+                alert("Ошибка бэктеста: " + err.message);
+            } finally {
+                btn.disabled = false;
+                spinner.classList.add("hidden");
+            }
+        }
+
+        // ======================= INITIALIZATION =======================
+
+        refreshData();
+        refreshTradesLog();
+        initWebSocket();
+        setTimeout(initCharts, 300);
+
+        // Fallback polling for logs and backup status check
+        setInterval(refreshTradesLog, 8000);
+        setInterval(() => {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                refreshData();
+            }
+        }, 5000);
+    </script>
+</body>
+</html>

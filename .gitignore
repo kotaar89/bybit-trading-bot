@@ -1,0 +1,25 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+config.local.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+
+# Data and logs
+data/
+*.log
+bot.log
+trade.log
+test.py
+
+.gemini/
+bot_state.json
+
