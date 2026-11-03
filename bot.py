@@ -39,8 +39,8 @@ from config import (
     VOLUME_FILTER, USE_MTF_FILTER, HTF_EMA_PERIOD,
     USE_ATR_STOPS, ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-    USE_BREAKEVEN, BREAKEVEN_TRIGGER, BREAKEVEN_OFFSET,
-    USE_TRAILING_STOP, TRAILING_STOP_TRIGGER, TRAILING_STOP_ATR_MULT, TRAILING_STOP_FALLBACK,
+    USE_BREAKEVEN, BREAKEVEN_TRIGGER, BREAKEVEN_R_MULT, BREAKEVEN_OFFSET,
+    USE_TRAILING_STOP, TRAILING_STOP_TRIGGER, TRAILING_STOP_R_MULT, TRAILING_STOP_ATR_MULT, TRAILING_STOP_FALLBACK,
     USE_NATIVE_TRAILING_STOP,
     USE_PARTIAL_TP, PARTIAL_TP_R_MULT, PARTIAL_TP_RATIO, PARTIAL_TP_MOVE_BE,
     USE_EXCHANGE_TP1,
@@ -185,6 +185,8 @@ class BybitMultiFuturesBot:
         self.ws_last_update = {}
         self.ws_orders = {}      # {orderId: {"status": str, "cum_qty": float, "avg_price": float}}
         self.last_risk_api_call = {}
+        self.last_ws_public_msg = time.time()
+        self.last_ws_reconnect_attempt = time.time()
 
         # Риск-менеджмент: учет баланса и дневных убытков
         self.last_known_equity = 0.0
@@ -320,14 +322,14 @@ class BybitMultiFuturesBot:
             return 1 if side.lower() in ("buy", "long") else 2
         return 0
 
-    def _init_websocket(self):
-        """
-        Инициализирует фоновые WebSocket клиенты Bybit:
-        1. Публичный тикерный поток (linear) для получения цен без нагрузки на REST.
-        2. Приватный User Data Stream (position, order, execution) для мгновенной (<50ms) реакции.
-        """
-        # 1. Публичный WebSocket (рыночные котировки Bybit Demo транслируются с Mainnet, поэтому demo=False)
+    def _init_public_ws(self):
+        """Подключает публичный WebSocket тикеров (рыночные котировки Bybit Demo идут с Mainnet -> demo=False)."""
         try:
+            if getattr(self, "ws", None) is not None:
+                try:
+                    self.ws.exit()
+                except Exception:
+                    pass
             self.ws = WebSocket(
                 testnet=config.TESTNET,
                 demo=False,
@@ -338,30 +340,84 @@ class BybitMultiFuturesBot:
                 symbol=SYMBOLS,
                 callback=self._handle_ws_ticker
             )
+            self.last_ws_public_msg = time.time()
             log.info(f"Публичный WebSocket подключен и подписан на тикеры {len(SYMBOLS)} пар.")
         except Exception as e:
             log.warning(f"Публичный WebSocket не удалось подключить ({e}). Работаем через REST API fallback.")
             self.ws = None
 
-        # 2. Приватный WebSocket
+    def _init_private_ws(self):
+        """Подключает приватный WebSocket User Data Stream (position, execution, order)."""
         has_keys = bool(config.API_KEY and config.API_KEY not in ("your_demo_key", "your_live_key"))
+        if not has_keys:
+            return
+        try:
+            if getattr(self, "ws_private", None) is not None:
+                try:
+                    self.ws_private.exit()
+                except Exception:
+                    pass
+            self.ws_private = WebSocket(
+                testnet=config.TESTNET,
+                demo=config.DEMO,
+                api_key=config.API_KEY,
+                api_secret=config.API_SECRET,
+                channel_type="private",
+                restart_on_error=True
+            )
+            self.ws_private.position_stream(callback=self._handle_ws_position)
+            self.ws_private.execution_stream(callback=self._handle_ws_execution)
+            self.ws_private.order_stream(callback=self._handle_ws_order)
+            log.info("Приватный WebSocket успешно подключен (position, execution, order stream).")
+        except Exception as e:
+            log.warning(f"Приватный WebSocket не удалось подключить ({e}). Фоллбэк на REST sync_positions.")
+            self.ws_private = None
+
+    def _init_websocket(self):
+        """
+        Инициализирует фоновые WebSocket клиенты Bybit:
+        1. Публичный тикерный поток (linear) для получения цен без нагрузки на REST.
+        2. Приватный User Data Stream (position, order, execution) для мгновенной (<50ms) реакции.
+        """
+        self._init_public_ws()
+        self._init_private_ws()
+        self.last_ws_reconnect_attempt = time.time()
+
+    def check_and_reconnect_websockets(self):
+        """
+        Проверяет живость публичного и приватного WebSocket-потоков и автоматически
+        переподключает их, если после длительного обрыва сети/DNS потоки pybit завершились.
+        """
+        now = time.time()
+        if now - getattr(self, "last_ws_reconnect_attempt", 0.0) < 60.0:
+            return
+
+        pub_dead = False
+        if self.ws is None:
+            pub_dead = True
+        elif hasattr(self.ws, "is_connected") and not self.ws.is_connected():
+            pub_dead = True
+        elif now - getattr(self, "last_ws_public_msg", now) > 180.0:
+            pub_dead = True
+
+        has_keys = bool(config.API_KEY and config.API_KEY not in ("your_demo_key", "your_live_key"))
+        priv_dead = False
         if has_keys:
-            try:
-                self.ws_private = WebSocket(
-                    testnet=config.TESTNET,
-                    demo=config.DEMO,
-                    api_key=config.API_KEY,
-                    api_secret=config.API_SECRET,
-                    channel_type="private",
-                    restart_on_error=True
-                )
-                self.ws_private.position_stream(callback=self._handle_ws_position)
-                self.ws_private.execution_stream(callback=self._handle_ws_execution)
-                self.ws_private.order_stream(callback=self._handle_ws_order)
-                log.info("Приватный WebSocket успешно подключен (position, execution, order stream).")
-            except Exception as e:
-                log.warning(f"Приватный WebSocket не удалось подключить ({e}). Фоллбэк на REST sync_positions.")
-                self.ws_private = None
+            if self.ws_private is None:
+                priv_dead = True
+            elif hasattr(self.ws_private, "is_connected") and not self.ws_private.is_connected():
+                priv_dead = True
+
+        if pub_dead or priv_dead:
+            self.last_ws_reconnect_attempt = now
+            if pub_dead:
+                log.warning("Обнаружено отключение публичного WebSocket (тикеры не поступают). Переподключение...")
+                self._init_public_ws()
+            if priv_dead or pub_dead:
+                # При падении сети/DNS оба соединения могли повиснуть — обновляем и приватный поток
+                if has_keys and (priv_dead or (hasattr(self.ws_private, "is_connected") and not self.ws_private.is_connected())):
+                    log.warning("Обнаружено отключение приватного WebSocket. Переподключение...")
+                    self._init_private_ws()
 
     def _handle_ws_ticker(self, message: dict):
         """Callback-обработчик входящих тикеров WebSocket."""
@@ -369,6 +425,8 @@ class BybitMultiFuturesBot:
             data = message.get("data")
             if not data:
                 return
+            now = time.time()
+            self.last_ws_public_msg = now
             items = data if isinstance(data, list) else [data]
             for item in items:
                 sym = item.get("symbol")
@@ -378,7 +436,7 @@ class BybitMultiFuturesBot:
                 if last_p:
                     price = float(last_p)
                     self.ws_prices[sym] = price
-                    self.ws_last_update[sym] = time.time()
+                    self.ws_last_update[sym] = now
 
                     # Real-time реакция на стоп/трейлинг/TP если открыта позиция
                     if self.positions.get(sym) and self.risk_states.get(sym):
@@ -526,7 +584,12 @@ class BybitMultiFuturesBot:
                     should_manage = True
 
             if USE_BREAKEVEN and not risk.breakeven_applied and not should_manage:
-                be_updated, new_be_sl = risk.check_breakeven(price, trigger_pct=BREAKEVEN_TRIGGER, offset_pct=BREAKEVEN_OFFSET)
+                be_updated, new_be_sl = risk.check_breakeven(
+                    price,
+                    trigger_pct=BREAKEVEN_TRIGGER,
+                    offset_pct=BREAKEVEN_OFFSET,
+                    r_mult=BREAKEVEN_R_MULT
+                )
                 if be_updated:
                     rounded_be = self.round_price(symbol, new_be_sl)
                     cur_sl = pos.get("stop_loss", 0.0)
@@ -540,7 +603,8 @@ class BybitMultiFuturesBot:
                     low_price=risk.lowest_price,
                     trigger_pct=TRAILING_STOP_TRIGGER,
                     atr_mult=TRAILING_STOP_ATR_MULT,
-                    fallback_pct=TRAILING_STOP_FALLBACK
+                    fallback_pct=TRAILING_STOP_FALLBACK,
+                    r_mult=TRAILING_STOP_R_MULT
                 )
                 if trail_updated:
                     rounded_trail = self.round_price(symbol, new_trail_sl)
@@ -1060,12 +1124,13 @@ class BybitMultiFuturesBot:
                         except Exception as e:
                             log.error(f"[{symbol}] Ошибка исполнения Partial TP: {e}")
 
-            # 2. Безубыток: гарантированный перенос стопа при достижении триггера
+            # 2. Безубыток: гарантированный перенос стопа при достижении триггера (>= 1.0R)
             if USE_BREAKEVEN and not risk.breakeven_applied:
                 be_updated, new_sl = risk.check_breakeven(
                     current_price=curr_price,
                     trigger_pct=BREAKEVEN_TRIGGER,
-                    offset_pct=BREAKEVEN_OFFSET
+                    offset_pct=BREAKEVEN_OFFSET,
+                    r_mult=BREAKEVEN_R_MULT
                 )
                 if be_updated:
                     rounded_sl = self.round_price(symbol, new_sl)
@@ -1097,7 +1162,8 @@ class BybitMultiFuturesBot:
                     low_price=low_price,
                     trigger_pct=TRAILING_STOP_TRIGGER,
                     atr_mult=TRAILING_STOP_ATR_MULT,
-                    fallback_pct=TRAILING_STOP_FALLBACK
+                    fallback_pct=TRAILING_STOP_FALLBACK,
+                    r_mult=TRAILING_STOP_R_MULT
                 )
                 if trail_updated:
                     rounded_sl = self.round_price(symbol, new_sl)
@@ -1403,24 +1469,30 @@ class BybitMultiFuturesBot:
                                 qty=self.format_qty(symbol, tp1_qty),
                                 positionIdx=pos_idx,
                                 reduceOnly=True,
-                                timeInForce="GoodTillCancel"
+                                timeInForce="GTC"
                             )
                             risk_state.tp1_order_id = tp1_resp.get("result", {}).get("orderId", "")
                             trade_log.info(
-                                f"[{symbol}] На бирже выставлен лимитный ордер TP1 (reduceOnly): {tp1_qty} @ {risk_state.tp1_price}"
+                                f"[{symbol}] На бирже выставлен лимитный ордер TP1 (reduceOnly): {tp1_qty} @ {self.format_price(symbol, risk_state.tp1_price)}"
                             )
                         except Exception as e:
                             log.warning(f"[{symbol}] Не удалось выставить лимитный TP1 на бирже: {e}")
 
-                # Активация нативного трейлинг-стопа Bybit
+                # Активация нативного трейлинг-стопа Bybit (порог не ниже 1.0R профита)
                 if USE_TRAILING_STOP and USE_NATIVE_TRAILING_STOP:
                     trail_dist = self.round_price(
                         symbol,
-                        atr_value * TRAILING_STOP_ATR_MULT if atr_value > 0 else (price * TRAILING_STOP_FALLBACK)
+                        atr_value * TRAILING_STOP_ATR_MULT if atr_value > 0 else (actual_entry_price * TRAILING_STOP_FALLBACK)
                     )
+                    eff_trail_trigger = TRAILING_STOP_TRIGGER
+                    if risk_state.risk_r > 0 and actual_entry_price > 0 and TRAILING_STOP_R_MULT > 0:
+                        eff_trail_trigger = max(
+                            TRAILING_STOP_TRIGGER,
+                            (risk_state.risk_r * TRAILING_STOP_R_MULT) / actual_entry_price
+                        )
                     active_price = self.round_price(
                         symbol,
-                        price * (1 + TRAILING_STOP_TRIGGER if side == "Buy" else 1 - TRAILING_STOP_TRIGGER)
+                        actual_entry_price * (1 + eff_trail_trigger if side == "Buy" else 1 - eff_trail_trigger)
                     )
                     try:
                         self.client.set_trading_stop(
@@ -1549,6 +1621,9 @@ class BybitMultiFuturesBot:
             try:
                 # 1. Защита от дневной просадки (Circuit Breaker)
                 self.check_daily_circuit_breaker()
+
+                # 1.1. Авто-проверка и переподключение WebSocket после сетевых/DNS сбоев
+                self.check_and_reconnect_websockets()
 
                 # 2. Регулярная синхронизация времени с Bybit (каждые 60 минут)
                 if time.time() - self.last_time_sync > 3600:

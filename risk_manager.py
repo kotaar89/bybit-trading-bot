@@ -63,9 +63,17 @@ class PositionRiskState:
         if low < self.lowest_price:
             self.lowest_price = low
 
-    def check_breakeven(self, current_price: float, trigger_pct: float = 0.015, offset_pct: float = 0.002) -> tuple[bool, float]:
+    def check_breakeven(
+        self,
+        current_price: float,
+        trigger_pct: float = 0.015,
+        offset_pct: float = 0.002,
+        r_mult: float = 0.6
+    ) -> tuple[bool, float]:
         """
         Проверяет условие переноса Stop-Loss в безубыток.
+        Если известен исходный риск позиции (risk_r > 0), порог срабатывания
+        привязывается к r_mult * risk_r (по умолчанию 1.0R), но не ниже trigger_pct.
         Возвращает (активировать_ли, новый_уровень_SL).
         """
         if self.breakeven_applied:
@@ -74,15 +82,20 @@ class PositionRiskState:
         if self.entry_price <= 0:
             return False, self.stop_loss
 
+        effective_trigger = trigger_pct
+        if self.risk_r > 0 and r_mult > 0:
+            r_pct = (self.risk_r * r_mult) / self.entry_price
+            effective_trigger = max(trigger_pct, r_pct)
+
         if self.is_long:
             profit_pct = (current_price - self.entry_price) / self.entry_price
-            if profit_pct >= trigger_pct:
+            if profit_pct >= effective_trigger:
                 new_sl = self.entry_price * (1 + offset_pct)
                 if new_sl > self.stop_loss:
                     return True, new_sl
         else:
             profit_pct = (self.entry_price - current_price) / self.entry_price
-            if profit_pct >= trigger_pct:
+            if profit_pct >= effective_trigger:
                 new_sl = self.entry_price * (1 - offset_pct)
                 if self.stop_loss == 0.0 or new_sl < self.stop_loss:
                     return True, new_sl
@@ -168,7 +181,8 @@ class PositionRiskState:
         low_price: float,
         trigger_pct: float = 0.015,
         atr_mult: float = 1.5,
-        fallback_pct: float = 0.01
+        fallback_pct: float = 0.01,
+        r_mult: float = 0.7
     ) -> tuple[bool, float]:
         """
         Проверяет и подтягивает динамический трейлинг-стоп вслед за экстремумом.
@@ -183,10 +197,15 @@ class PositionRiskState:
         else:
             dist = current_price * fallback_pct
 
+        effective_trigger = trigger_pct
+        if self.risk_r > 0 and r_mult > 0 and self.entry_price > 0:
+            r_pct = (self.risk_r * r_mult) / self.entry_price
+            effective_trigger = max(trigger_pct, r_pct)
+
         if self.is_long:
             profit_pct = (current_price - self.entry_price) / self.entry_price
             # Активация трейлинга после достижения триггера
-            if profit_pct >= trigger_pct or self.trailing_active:
+            if profit_pct >= effective_trigger or self.trailing_active:
                 self.trailing_active = True
                 candidate_sl = self.highest_price - dist
                 # Трейлинг двигается только вверх
@@ -194,7 +213,7 @@ class PositionRiskState:
                     return True, candidate_sl
         else:
             profit_pct = (self.entry_price - current_price) / self.entry_price
-            if profit_pct >= trigger_pct or self.trailing_active:
+            if profit_pct >= effective_trigger or self.trailing_active:
                 self.trailing_active = True
                 candidate_sl = self.lowest_price + dist
                 # Трейлинг двигается только вниз

@@ -652,6 +652,48 @@ class TestV2Architecture(unittest.TestCase):
         self.assertTrue(bot.circuit_breaker_active)
         bot.panic_close_all.assert_called_once()
 
+    # =========================================================================
+    # 6.3: ЗАЩИТА ОТ РАННЕГО БЕЗУБЫТКА НА ШУМЕ (< 1.0R) И LIMIT TP1 timeInForce="GTC"
+    # =========================================================================
+    def test_r_based_breakeven_and_tp1_gtc_and_ws_reconnect(self):
+        from bot import BybitMultiFuturesBot
+        # 1. Сделка NEARUSDT SHORT из реального лога: Вход 4.163, SL 4.402 (1R = 0.239 = 5.74%)
+        pos = PositionRiskState(
+            symbol="NEARUSDT",
+            side="Sell",
+            entry_price=4.163,
+            size=49.8,
+            initial_size=49.8,
+            stop_loss=4.402,
+            take_profit=3.675,
+            atr_value=0.1086
+        )
+        # При ходе цены -1.5% (4.100 = всего 0.26R) безубыток НЕ должен активироваться!
+        be_trig, _ = pos.check_breakeven(current_price=4.100, trigger_pct=0.015, offset_pct=0.002, r_mult=0.6)
+        self.assertFalse(be_trig)
+
+        # При прохождении >= 0.6R (4.015 <= 4.163 - 0.6 * 0.239) безубыток активируется!
+        be_trig_r, new_sl = pos.check_breakeven(current_price=4.015, trigger_pct=0.015, offset_pct=0.002, r_mult=0.6)
+        self.assertTrue(be_trig_r)
+        self.assertAlmostEqual(new_sl, 4.163 * (1 - 0.002), places=4)
+
+        # 2. Проверка Limit TP1 с timeInForce="GTC" и авто-реконнекта WebSocket
+        bot = object.__new__(BybitMultiFuturesBot)
+        bot.lock = threading.RLock()
+        bot.last_ws_reconnect_attempt = 0.0
+        bot.last_ws_public_msg = 0.0
+        bot.ws = MagicMock()
+        bot.ws.is_connected.return_value = False
+        bot.ws_private = MagicMock()
+        bot.ws_private.is_connected.return_value = False
+        bot._init_public_ws = MagicMock()
+        bot._init_private_ws = MagicMock()
+
+        with patch.object(config, "API_KEY", "real_key"):
+            bot.check_and_reconnect_websockets()
+            bot._init_public_ws.assert_called_once()
+            bot._init_private_ws.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

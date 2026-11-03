@@ -29,8 +29,8 @@ from config import (
     VOLUME_FILTER, USE_MTF_FILTER, HTF_EMA_PERIOD,
     USE_ATR_STOPS, ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-    USE_BREAKEVEN, BREAKEVEN_TRIGGER, BREAKEVEN_OFFSET,
-    USE_TRAILING_STOP, TRAILING_STOP_TRIGGER, TRAILING_STOP_ATR_MULT, TRAILING_STOP_FALLBACK,
+    USE_BREAKEVEN, BREAKEVEN_TRIGGER, BREAKEVEN_R_MULT, BREAKEVEN_OFFSET,
+    USE_TRAILING_STOP, TRAILING_STOP_TRIGGER, TRAILING_STOP_R_MULT, TRAILING_STOP_ATR_MULT, TRAILING_STOP_FALLBACK,
     USE_PARTIAL_TP, PARTIAL_TP_R_MULT, PARTIAL_TP_RATIO, PARTIAL_TP_MOVE_BE,
     USE_MARKET_REGIME_FILTER, BENCHMARK_SYMBOL, BENCHMARK_INTERVAL,
     BENCHMARK_EMA_PERIOD, BENCHMARK_RSI_THRESHOLD, BENCHMARK_DUMP_PCT, BENCHMARK_DUMP_CANDLES,
@@ -424,7 +424,8 @@ def run_backtest_symbol(
                     be_updated, new_sl = pos_state.check_breakeven(
                         current_price=close_price,
                         trigger_pct=BREAKEVEN_TRIGGER,
-                        offset_pct=BREAKEVEN_OFFSET
+                        offset_pct=BREAKEVEN_OFFSET,
+                        r_mult=BREAKEVEN_R_MULT
                     )
                     if be_updated:
                         pos_state.stop_loss = new_sl
@@ -437,7 +438,8 @@ def run_backtest_symbol(
                         low_price=low_price,
                         trigger_pct=TRAILING_STOP_TRIGGER,
                         atr_mult=trailing_atr_mult,
-                        fallback_pct=TRAILING_STOP_FALLBACK
+                        fallback_pct=TRAILING_STOP_FALLBACK,
+                        r_mult=TRAILING_STOP_R_MULT
                     )
                     if trail_updated:
                         pos_state.stop_loss = new_sl

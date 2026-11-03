@@ -142,7 +142,8 @@ TAKE_PROFIT_PCT     = _get_float("TAKE_PROFIT_PCT", 0.045)
 
 # Безубыток (Breakeven)
 USE_BREAKEVEN       = _get_bool("USE_BREAKEVEN", True)
-BREAKEVEN_TRIGGER   = _get_float("BREAKEVEN_TRIGGER", 0.015)   # +1.5% хода цены в плюс
+BREAKEVEN_TRIGGER   = _get_float("BREAKEVEN_TRIGGER", 0.015)   # Мин. % хода цены в плюс (fallback)
+BREAKEVEN_R_MULT    = _get_float("BREAKEVEN_R_MULT", 0.6)      # Перевод в БУ не ранее 0.6R (1.32x ATR) профита
 BREAKEVEN_OFFSET    = _get_float("BREAKEVEN_OFFSET", 0.002)    # +0.2% от цены входа (комиссии)
 
 
@@ -153,7 +154,8 @@ BREAKEVEN_OFFSET    = _get_float("BREAKEVEN_OFFSET", 0.002)    # +0.2% от це
 # 6.1. Трейлинг-стоп (Trailing Stop)
 USE_TRAILING_STOP        = _get_bool("USE_TRAILING_STOP", True)
 USE_NATIVE_TRAILING_STOP = _get_bool("USE_NATIVE_TRAILING_STOP", True)  # Выставлять нативный trailingStop Bybit
-TRAILING_STOP_TRIGGER    = _get_float("TRAILING_STOP_TRIGGER", 0.015)   # +1.5% хода активирует трейлинг
+TRAILING_STOP_TRIGGER    = _get_float("TRAILING_STOP_TRIGGER", 0.015)   # Мин. % хода (fallback)
+TRAILING_STOP_R_MULT     = _get_float("TRAILING_STOP_R_MULT", 0.7)      # Активация трейлинга от 0.7R (1.54x ATR) профита
 TRAILING_STOP_ATR_MULT   = _get_float("TRAILING_STOP_ATR_MULT", 2.2)    # дистанция трейлинга в ATR
 TRAILING_STOP_FALLBACK   = _get_float("TRAILING_STOP_FALLBACK", 0.01)   # 1.0% если ATR недоступен
 
