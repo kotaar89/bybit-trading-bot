@@ -216,25 +216,8 @@ def run_backtest_symbol(
         if atr <= 0:
             atr = open_price * 0.015
 
-        # 1. Фильтрация сентимента рынка по бенчмарку (O(1) из предварительно объединенной строки)
-        if raw_signal != 0 and USE_MARKET_REGIME_FILTER:
-            if raw_signal == 1:
-                allowed = bool(candle.get(
-                    "BENCH_SELF_LONG_ALLOWED" if is_benchmark_symbol else "BENCH_LONG_ALLOWED",
-                    True
-                ))
-                if not allowed:
-                    raw_signal = 0
-            elif raw_signal == -1:
-                allowed = bool(candle.get(
-                    "BENCH_SELF_SHORT_ALLOWED" if is_benchmark_symbol else "BENCH_SHORT_ALLOWED",
-                    True
-                ))
-                if not allowed:
-                    raw_signal = 0
-
-        # 2. Симуляция исполнения на ОТКРЫТИИ свечи i (устранение Lookahead Bias)
-        # Если есть открытая позиция и получен сигнал разворота:
+        # 1. Симуляция исполнения на ОТКРЫТИИ свечи i (устранение Lookahead Bias)
+        # Если есть открытая позиция и получен сигнал разворота — закрываем позицию ДО фильтра сентимента BTC:
         if raw_signal == 1 and pos_state is not None and not pos_state.is_long:
             # Закрываем short по open свечи с учетом динамического проскальзывания
             exit_slip = calculate_dynamic_slippage(atr, open_price)
@@ -282,6 +265,23 @@ def run_backtest_symbol(
             })
             pos_state = None
             entry_idx = None
+
+        # 2. Фильтрация сентимента рынка по бенчмарку для открытия новой позиции (O(1))
+        if raw_signal != 0 and USE_MARKET_REGIME_FILTER:
+            if raw_signal == 1:
+                allowed = bool(candle.get(
+                    "BENCH_SELF_LONG_ALLOWED" if is_benchmark_symbol else "BENCH_LONG_ALLOWED",
+                    True
+                ))
+                if not allowed:
+                    raw_signal = 0
+            elif raw_signal == -1:
+                allowed = bool(candle.get(
+                    "BENCH_SELF_SHORT_ALLOWED" if is_benchmark_symbol else "BENCH_SHORT_ALLOWED",
+                    True
+                ))
+                if not allowed:
+                    raw_signal = 0
 
         # Открытие новой позиции на ОТКРЫТИИ свечи i
         if pos_state is None and raw_signal != 0:

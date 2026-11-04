@@ -694,6 +694,49 @@ class TestV2Architecture(unittest.TestCase):
             bot._init_public_ws.assert_called_once()
             bot._init_private_ws.assert_called_once()
 
+    def test_exchange_close_logging_and_closed_candle_regime_and_daily_risk_cap(self):
+        from bot import BybitMultiFuturesBot
+        # 1. Проверка что MarketRegimeFilter проверяет EMA/RSI по закрытой 4H свече (iloc[-2])
+        regime = MarketRegimeFilter(benchmark_symbol="BTCUSDT", ema_period=20, rsi_threshold=45.0)
+        dates = pd.date_range("2026-01-01", periods=50, freq="4h")
+        # Медвежий тренд до предпоследней свечи (iloc[-2] ниже EMA), а на текущей незакрытой (iloc[-1]) ложный прокол вверх
+        closes = np.linspace(60000, 40000, 50)
+        closes[-1] = 48000.0  # Незакрытая свеча проколола EMA вверх
+        df_fake_spike = pd.DataFrame({
+            "timestamp": dates,
+            "open": closes,
+            "high": closes + 200,
+            "low": closes - 200,
+            "close": closes,
+            "volume": [1000] * 50
+        })
+        allowed, _ = regime.is_long_allowed("NEARUSDT", df_fake_spike)
+        self.assertFalse(allowed)
+
+        # 2. Проверка блокировки новой сделки при исчерпании дневного лимита убытка (Circuit Breaker trap)
+        bot = object.__new__(BybitMultiFuturesBot)
+        bot.lock = threading.RLock()
+        bot.instruments = {
+            "NEARUSDT": {
+                "qty_step": 0.1, "min_qty": 0.1, "min_notional": 5.0,
+                "tick_size": 0.001, "qty_decimals": 1, "price_decimals": 3
+            }
+        }
+        bot.positions = {}
+        bot.circuit_breaker_active = False
+        bot.start_day_balance = 1000.0
+        bot.last_known_equity = 953.0  # Уже потеряно 4.7% из 5.0% дневного лимита (осталось 3$ < 40% от 15$ риска)
+        bot.last_equity_ok = True
+        bot.get_available_balance = MagicMock(return_value=953.0)
+        bot.get_open_positions_count = MagicMock(return_value=0)
+        bot.strategy = MagicMock()
+        bot.strategy.calculate_stops.return_value = {"sl": 4.5, "tp": 5.0, "sl_dist": 0.15, "type": "ATR"}
+        bot.round_price = lambda sym, p: round(p, 3)
+        bot.round_qty = lambda sym, q: round(q, 1)
+
+        res = bot.open_position("NEARUSDT", "Buy", price=4.65, atr_value=0.07)
+        self.assertIsNone(res)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -184,6 +184,7 @@ class BybitMultiFuturesBot:
         self.ws_prices = {}
         self.ws_last_update = {}
         self.ws_orders = {}      # {orderId: {"status": str, "cum_qty": float, "avg_price": float}}
+        self.last_exec_prices = {}
         self.last_risk_api_call = {}
         self.last_ws_public_msg = time.time()
         self.last_ws_reconnect_attempt = time.time()
@@ -444,6 +445,41 @@ class BybitMultiFuturesBot:
         except Exception as e:
             log.debug(f"Ошибка в WebSocket ticker handler: {e}")
 
+    def _log_exchange_close(self, sym: str, cur_pos: dict, cur_risk: Optional[PositionRiskState], source: str = "WebSocket"):
+        """Формирует и записывает в trade.log строку закрытия позиции на бирже с расчетом PnL % для веб-дашборда."""
+        try:
+            entry_price = float(cur_pos.get("entry_price") or (cur_risk.entry_price if cur_risk else 0.0) or 0.0)
+            exec_p = getattr(self, "last_exec_prices", {}).get(sym)
+            ws_p = getattr(self, "ws_prices", {}).get(sym)
+            sl_p = float((cur_risk.stop_loss if cur_risk else 0.0) or cur_pos.get("stop_loss") or 0.0)
+            exit_price = float(exec_p or ws_p or sl_p or entry_price or 0.0)
+
+            if cur_risk and cur_risk.trailing_active:
+                reason = "Trailing SL"
+            elif cur_risk and cur_risk.breakeven_applied:
+                reason = "Безубыток"
+            else:
+                reason = "SL/TP на бирже"
+
+            if entry_price > 0 and exit_price > 0:
+                is_short = (
+                    str(cur_pos.get("position", "")).lower() == "short"
+                    or str(cur_pos.get("side", "")).lower() == "sell"
+                )
+                pnl_pct = ((exit_price - entry_price) / entry_price) * 100.0
+                if is_short:
+                    pnl_pct = -pnl_pct
+                pnl_pct *= LEVERAGE
+                sign = "+" if pnl_pct > 0 else ""
+                trade_log.info(
+                    f"[{sym}] Закрыто ({source}: {reason}) @ {exit_price} | PnL: {sign}{pnl_pct:.2f}%"
+                )
+            else:
+                trade_log.info(f"[{sym}] {source}: Позиция закрыта на бирже (size=0).")
+        except Exception as e:
+            log.debug(f"Ошибка логирования закрытия на бирже [{sym}]: {e}")
+            trade_log.info(f"[{sym}] {source}: Позиция закрыта на бирже (size=0).")
+
     def _handle_ws_position(self, message: dict):
         """
         Real-time обработчик изменений позиций по приватному WebSocket Bybit.
@@ -475,7 +511,7 @@ class BybitMultiFuturesBot:
                     if size == 0.0:
                         # Позиция закрыта на бирже
                         if cur_pos is not None:
-                            trade_log.info(f"[{sym}] WebSocket: Позиция закрыта на бирже (size=0).")
+                            self._log_exchange_close(sym, cur_pos, cur_risk, source="WebSocket")
                             self.positions[sym] = None
                             self.risk_states[sym] = None
                             self.breakeven_applied[sym] = False
@@ -527,6 +563,13 @@ class BybitMultiFuturesBot:
                 exec_q = item.get("execQty")
                 side = item.get("side")
                 exec_type = item.get("execType", "Trade")
+                if sym and exec_p:
+                    try:
+                        if not hasattr(self, "last_exec_prices"):
+                            self.last_exec_prices = {}
+                        self.last_exec_prices[sym] = float(exec_p)
+                    except Exception:
+                        pass
                 trade_log.info(f"[{sym}] WS Fill ({exec_type}): {side} {exec_q} @ {exec_p}")
         except Exception as e:
             log.debug(f"Ошибка в WS execution handler: {e}")
@@ -886,7 +929,7 @@ class BybitMultiFuturesBot:
                     new_pos = live_map.get(sym)
 
                     if old_pos and not new_pos:
-                        trade_log.info(f"[{sym}] Позиция закрыта на бирже (вероятно, сработал SL/TP)")
+                        self._log_exchange_close(sym, old_pos, self.risk_states.get(sym), source="Sync")
                         self.breakeven_applied[sym] = False
                         self.risk_states[sym] = None
                         self.save_state()
@@ -1230,6 +1273,19 @@ class BybitMultiFuturesBot:
                 # Расчет объема позиции
                 if USE_RISK_BASED_SIZING and stops.get("sl_dist", 0) > 0:
                     risk_capital = balance * RISK_PER_TRADE_PCT
+                    # Ограничиваем риск новой сделки остатком дневного лимита просадки (с буфером 80%),
+                    # чтобы не попасть под мгновенный Circuit Breaker (PANIC CLOSE) на внутрисвечном шуме
+                    start_day_bal = float(getattr(self, "start_day_balance", 0.0) or 0.0)
+                    last_eq = float(getattr(self, "last_known_equity", 0.0) or balance)
+                    if start_day_bal > 0 and getattr(self, "last_equity_ok", False):
+                        remaining_daily_loss = max(0.0, (start_day_bal * MAX_DAILY_LOSS_PCT) - max(0.0, start_day_bal - last_eq))
+                        if remaining_daily_loss < risk_capital * 0.4:
+                            log.warning(
+                                f"[{symbol}] Остаток дневного лимита убытка ({remaining_daily_loss:.2f}$) слишком мал "
+                                f"для открытия новой сделки (риск {risk_capital:.2f}$). Вход пропущен."
+                            )
+                            return None
+                        risk_capital = min(risk_capital, remaining_daily_loss * 0.8)
                     raw_qty = risk_capital / stops["sl_dist"]
                     max_margin = max(balance * POSITION_SIZE_PCT, 10.0)
                     max_qty = (max_margin * LEVERAGE) / price
@@ -1405,6 +1461,9 @@ class BybitMultiFuturesBot:
                             closeOnTrigger=False,
                         )
                         qty = self.round_qty(symbol, filled_qty + rem_qty)
+                        ws_p = getattr(self, "ws_prices", {}).get(symbol)
+                        if isinstance(ws_p, (int, float)) and ws_p > 0:
+                            actual_entry_price = float(ws_p)
                     elif filled_qty >= min_qty:
                         executed = True
                         qty = self.round_qty(symbol, filled_qty)
@@ -1513,7 +1572,7 @@ class BybitMultiFuturesBot:
 
                 trade_log.info(
                     f"[{symbol}] {'LONG' if side == 'Buy' else 'SHORT'} открыт | "
-                    f"Вход: {price} | Кол-во: {qty} ({trade_margin:.1f}$ маржа) | "
+                    f"Вход: {actual_entry_price} | Кол-во: {qty} ({trade_margin:.1f}$ маржа) | "
                     f"SL: {sl} | TP: {tp} [{stops['type']}] | x{LEVERAGE}"
                 )
                 return resp
@@ -1681,7 +1740,16 @@ class BybitMultiFuturesBot:
                     if signal_time != self.last_handled_candles.get(symbol):
                         self.last_handled_candles[symbol] = signal_time
 
-                        # Направленная защита от неблагоприятного проскальзывания цены
+                        # 1. Приоритетное закрытие встречной позиции при сигнале смены тренда
+                        # (выполняется ДО фильтра сентимента BTC и проверки проскальзывания входа)
+                        if signal == 1 and current_pos and current_pos.get("position") == "short":
+                            self.close_position(symbol, price, "Смена тренда на LONG")
+                            current_pos = None
+                        elif signal == -1 and current_pos and current_pos.get("position") == "long":
+                            self.close_position(symbol, price, "Смена тренда на SHORT")
+                            current_pos = None
+
+                        # 2. Направленная защита от неблагоприятного проскальзывания цены для нового входа
                         if signal == 1:
                             slippage = (price - signal_price) / signal_price
                         elif signal == -1:
@@ -1696,27 +1764,22 @@ class BybitMultiFuturesBot:
                             )
                             continue
 
-                        # Проверка фильтра рыночного сентимента по BTC для LONG
+                        # 3. Проверка фильтра рыночного сентимента по BTC для открытия новой позиции
                         if signal == 1 and USE_MARKET_REGIME_FILTER and bench_df is not None:
                             allowed, r_msg = self.regime_filter.is_long_allowed(symbol, bench_df)
                             if not allowed:
                                 log.info(f"[{symbol}] {r_msg}")
                                 signal = 0
-
-                        # Проверка фильтра рыночного сентимента по BTC для SHORT
                         elif signal == -1 and USE_MARKET_REGIME_FILTER and bench_df is not None:
                             allowed, r_msg = self.regime_filter.is_short_allowed(symbol, bench_df)
                             if not allowed:
                                 log.info(f"[{symbol}] {r_msg}")
                                 signal = 0
 
-                        # Проверка фильтра старшего тренда (4H EMA) только при наличии сигнала
+                        # 4. Проверка фильтра старшего тренда (4H EMA) и открытие новой позиции
                         htf_trend = self.get_higher_trend(symbol) if (USE_MTF_FILTER and signal != 0) else "neutral"
 
                         if signal == 1:
-                            if current_pos and current_pos["position"] == "short":
-                                self.close_position(symbol, price, "Смена тренда на LONG")
-
                             if not self.positions.get(symbol):
                                 if USE_MTF_FILTER and htf_trend == "bearish":
                                     log.info(f"[{symbol}] Сигнал LONG отклонен: старший тренд 4H медвежий")
@@ -1726,9 +1789,6 @@ class BybitMultiFuturesBot:
                             self.last_handled_candles[symbol] = signal_time
 
                         elif signal == -1:
-                            if current_pos and current_pos["position"] == "long":
-                                self.close_position(symbol, price, "Смена тренда на SHORT")
-
                             if not self.positions.get(symbol):
                                 if USE_MTF_FILTER and htf_trend == "bullish":
                                     log.info(f"[{symbol}] Сигнал SHORT отклонен: старший тренд 4H бычий")

@@ -92,8 +92,8 @@ def parse_trade_log(limit: int = 50) -> list[dict]:
                 }
 
             # Ищем событие
-            if "ЧАСТИЧНЫЙ ТЕЙК-ПРОФИТ" in line:
-                trades.append(_make_entry(symbol, "ЧАСТИЧНЫЙ TP (1.5R)", "", 0.0, True))
+            if "ЧАСТИЧНЫЙ ТЕЙК-ПРОФИТ" in line or "частичное закрытие TP1" in line:
+                trades.append(_make_entry(symbol, "ЧАСТИЧНЫЙ TP", "", 0.0, True))
             elif "Трейлинг-стоп подтянут" in line:
                 trades.append(_make_entry(symbol, "ТРЕЙЛИНГ-СТОП", "", 0.0, True))
             elif "Стоп перенесен в безубыток" in line or "Безубыток активирован" in line:
@@ -101,7 +101,7 @@ def parse_trade_log(limit: int = 50) -> list[dict]:
             elif "открыт" in line:
                 side = "LONG" if "LONG" in line else ("SHORT" if "SHORT" in line else "OPEN")
                 trades.append(_make_entry(symbol, f"ОТКРЫТИЕ {side}", "", 0.0, None))
-            elif "Закрыто" in line:
+            elif "Закрыто" in line or "Позиция закрыта на бирже" in line:
                 pnl_match = re.search(r"PnL:\s*([+-]?\d+\.?\d*)%", line)
                 pnl_val = float(pnl_match.group(1)) if pnl_match else 0.0
                 pnl_str = f"{pnl_match.group(1)}%" if pnl_match else ""

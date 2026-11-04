@@ -22,10 +22,10 @@ from config import (
     ATR_PERIOD, ATR_SL_MULT, ATR_TP_MULT, TRAILING_STOP_ATR_MULT,
     LEVERAGE, ACTIVE_STRATEGY,
     RSI_LONG_MIN, RSI_LONG_MAX, RSI_SHORT_MIN, RSI_SHORT_MAX, VOLUME_FILTER,
-    USE_TRAILING_STOP, TRAILING_STOP_TRIGGER, TRAILING_STOP_FALLBACK,
+    USE_TRAILING_STOP, TRAILING_STOP_TRIGGER, TRAILING_STOP_R_MULT, TRAILING_STOP_FALLBACK,
     USE_PARTIAL_TP, PARTIAL_TP_R_MULT, PARTIAL_TP_RATIO, PARTIAL_TP_MOVE_BE,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, USE_ATR_STOPS,
-    SIGNAL_LOOKBACK_CANDLES, USE_BREAKEVEN, BREAKEVEN_TRIGGER, BREAKEVEN_OFFSET,
+    SIGNAL_LOOKBACK_CANDLES, USE_BREAKEVEN, BREAKEVEN_TRIGGER, BREAKEVEN_R_MULT, BREAKEVEN_OFFSET,
     USE_ADX_FILTER, ADX_PERIOD, ADX_THRESHOLD
 )
 from data_loader import load_or_download
@@ -220,7 +220,8 @@ def simulate_strategy_slice(
                     be_updated, new_sl = pos_state.check_breakeven(
                         current_price=price,
                         trigger_pct=BREAKEVEN_TRIGGER,
-                        offset_pct=BREAKEVEN_OFFSET
+                        offset_pct=BREAKEVEN_OFFSET,
+                        r_mult=BREAKEVEN_R_MULT
                     )
                     if be_updated:
                         pos_state.stop_loss = new_sl
@@ -234,7 +235,8 @@ def simulate_strategy_slice(
                         low_price=low_p,
                         trigger_pct=TRAILING_STOP_TRIGGER,
                         atr_mult=trailing_mult,
-                        fallback_pct=TRAILING_STOP_FALLBACK
+                        fallback_pct=TRAILING_STOP_FALLBACK,
+                        r_mult=TRAILING_STOP_R_MULT
                     )
                     if trail_updated:
                         pos_state.stop_loss = new_sl

@@ -339,12 +339,13 @@ class MarketRegimeFilter:
         if symbol.upper() == self.benchmark_symbol.upper():
             return True, "OK (Бенчмарк)"
 
-        # 2. Проверка старшей EMA
-        last_close = close.iloc[-1]
+        # 2. Проверка старшей EMA (по последней закрытой свече idx=-2 для защиты от ложных теней)
+        idx = -2 if len(df) >= 2 else -1
+        last_close = float(close.iloc[idx])
         if "BENCH_EMA" in df.columns:
-            last_ema = df["BENCH_EMA"].iloc[-1]
+            last_ema = float(df["BENCH_EMA"].iloc[idx])
         else:
-            last_ema = close.ewm(span=self.ema_period, adjust=False).mean().iloc[-1]
+            last_ema = float(close.ewm(span=self.ema_period, adjust=False).mean().iloc[idx])
 
         if last_close < last_ema:
             msg = (
@@ -353,15 +354,15 @@ class MarketRegimeFilter:
             )
             return False, msg
 
-        # 3. Проверка RSI бенчмарка
+        # 3. Проверка RSI бенчмарка (по последней закрытой свече idx=-2)
         if "BENCH_RSI" in df.columns:
-            last_rsi = df["BENCH_RSI"].iloc[-1]
+            last_rsi = float(df["BENCH_RSI"].iloc[idx])
         else:
             delta = close.diff()
             gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
             loss = -delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
-            last_gain = float(gain.iloc[-1])
-            last_loss = float(loss.iloc[-1])
+            last_gain = float(gain.iloc[idx])
+            last_loss = float(loss.iloc[idx])
             if last_loss == 0.0:
                 last_rsi = 100.0 if last_gain > 0 else 50.0
             else:
@@ -408,22 +409,23 @@ class MarketRegimeFilter:
         if symbol.upper() == self.benchmark_symbol.upper():
             return True, "OK (Бенчмарк)"
 
-        # 2. Проверка старшей EMA
-        last_close = close.iloc[-1]
+        # 2. Проверка старшей EMA (по последней закрытой свече idx=-2)
+        idx = -2 if len(df) >= 2 else -1
+        last_close = float(close.iloc[idx])
         if "BENCH_EMA" in df.columns:
-            last_ema = df["BENCH_EMA"].iloc[-1]
+            last_ema = float(df["BENCH_EMA"].iloc[idx])
         else:
-            last_ema = close.ewm(span=self.ema_period, adjust=False).mean().iloc[-1]
+            last_ema = float(close.ewm(span=self.ema_period, adjust=False).mean().iloc[idx])
 
-        # 3. Проверка RSI бенчмарка
+        # 3. Проверка RSI бенчмарка (по последней закрытой свече idx=-2)
         if "BENCH_RSI" in df.columns:
-            last_rsi = df["BENCH_RSI"].iloc[-1]
+            last_rsi = float(df["BENCH_RSI"].iloc[idx])
         else:
             delta = close.diff()
             gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
             loss = -delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
-            last_gain = float(gain.iloc[-1])
-            last_loss = float(loss.iloc[-1])
+            last_gain = float(gain.iloc[idx])
+            last_loss = float(loss.iloc[idx])
             if last_loss == 0.0:
                 last_rsi = 100.0 if last_gain > 0 else 50.0
             else:

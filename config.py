@@ -162,7 +162,7 @@ TRAILING_STOP_FALLBACK   = _get_float("TRAILING_STOP_FALLBACK", 0.01)   # 1.0% �
 # 6.2. Частичная фиксация прибыли (Partial TP)
 USE_PARTIAL_TP      = _get_bool("USE_PARTIAL_TP", True)
 USE_EXCHANGE_TP1    = _get_bool("USE_EXCHANGE_TP1", True)          # Лимитный ордер reduceOnly на бирже
-PARTIAL_TP_R_MULT   = _get_float("PARTIAL_TP_R_MULT", 1.5)         # TP1 на 1.5R (R = дистанция SL)
+PARTIAL_TP_R_MULT   = _get_float("PARTIAL_TP_R_MULT", 1.2)         # TP1 на 1.2R (R = дистанция SL)
 PARTIAL_TP_RATIO    = _get_float("PARTIAL_TP_RATIO", 0.5)          # Закрывать 50% объема
 PARTIAL_TP_MOVE_BE  = _get_bool("PARTIAL_TP_MOVE_BE", True)        # Переносить стоп в безубыток при TP1
 
