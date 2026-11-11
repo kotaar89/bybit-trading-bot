@@ -25,3 +25,10 @@ bot_state.json
 bot_control.json
 bot_live_status.json
 
+# SQLite databases & strategy profiles
+*.db
+*.db-wal
+*.db-shm
+bot_data.db*
+strategy_profiles.json
+

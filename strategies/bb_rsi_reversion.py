@@ -67,6 +67,9 @@ class BbRsiReversionStrategy(BaseStrategy):
         df.loc[short_cond, "exit_signal"] = -1
         df.loc[long_cond, "signal"] = 1
         df.loc[short_cond, "signal"] = -1
+        df["SIGNAL_REGIME"] = "RANGE"
+        df["mr_exit_long"] = (df["close"] >= df["BB_middle"]) & df["BB_middle"].notna()
+        df["mr_exit_short"] = (df["close"] <= df["BB_middle"]) & df["BB_middle"].notna()
         return self.apply_mtf_filter_to_df(df)
 
     def generate_signal(self, df: pd.DataFrame, htf_df: pd.DataFrame | None = None, candle_idx: int = -2) -> int:

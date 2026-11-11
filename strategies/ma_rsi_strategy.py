@@ -134,7 +134,7 @@ class MaRsiStrategy(BaseStrategy):
         df.loc[short_cond, "signal"] = -1
         return df
 
-    def get_mtf_trend(self, htf_df: pd.DataFrame) -> str:
+    def get_mtf_trend(self, htf_df: pd.DataFrame, candle_idx: int = -2) -> str:
         """
         Определяет тренд на старшем таймфрейме: 'bullish', 'bearish' или 'neutral'.
         """
@@ -145,8 +145,9 @@ class MaRsiStrategy(BaseStrategy):
             return "neutral"
 
         ema_htf = self.calc_ema(htf_df["close"], self.htf_ema_period)
-        last_close = htf_df["close"].iloc[-2]  # по закрытой свече
-        last_ema = ema_htf.iloc[-2]
+        idx = candle_idx if abs(candle_idx) <= len(htf_df) else (-2 if len(htf_df) >= 2 else -1)
+        last_close = htf_df["close"].iloc[idx]  # по закрытой свече
+        last_ema = ema_htf.iloc[idx]
 
         if last_close > last_ema:
             return "bullish"

@@ -37,9 +37,9 @@ from config import (
     SIGNAL_LOOKBACK_CANDLES, BENCHMARK_BULL_RSI_THRESHOLD, BENCHMARK_PUMP_PCT,
     USE_ADX_FILTER, ADX_PERIOD, ADX_THRESHOLD
 )
-from data_loader import load_or_download, load_or_download_funding, INTERVAL_MINUTES
+from data_loader import load_or_download, load_or_download_funding, load_or_download_open_interest, INTERVAL_MINUTES
 from strategies import get_strategy
-from risk_manager import PositionRiskState, MarketRegimeFilter
+from risk_manager import PositionRiskState, MarketRegimeFilter, PortfolioRiskManager
 
 # Базовые комиссии Bybit VIP0
 TAKER_FEE = 0.00055   # 0.055%
@@ -146,11 +146,13 @@ def align_benchmark_to_ltf(
     df: pd.DataFrame,
     benchmark_df: pd.DataFrame,
     interval: str,
-    benchmark_interval: str
+    benchmark_interval: str,
+    funding_df: pd.DataFrame | None = None,
+    oi_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Привязывает закрытые 4H бары бенчмарка BTC к 1H свечам строго по времени закрытия.
-    Исключает Lookahead Bias и NaN -> True утечку.
+    Привязывает закрытые 4H бары бенчмарка BTC (и деривативов Funding Z-score / OI) к 1H свечам
+    строго по времени закрытия. Исключает Lookahead Bias и NaN -> True утечку.
     """
     res = df.copy()
     if benchmark_df is None or benchmark_df.empty:
@@ -166,7 +168,19 @@ def align_benchmark_to_ltf(
             dump_pct_threshold=BENCHMARK_DUMP_PCT,
             pump_pct_threshold=BENCHMARK_PUMP_PCT,
             rsi_threshold=BENCHMARK_RSI_THRESHOLD,
-            bull_rsi_threshold=BENCHMARK_BULL_RSI_THRESHOLD
+            bull_rsi_threshold=BENCHMARK_BULL_RSI_THRESHOLD,
+            fast_ema_period=getattr(config, "REGIME_FAST_EMA_PERIOD", 50),
+            use_hybrid_trend=getattr(config, "REGIME_USE_HYBRID_TREND", True),
+            funding_df=funding_df,
+            oi_df=oi_df,
+            funding_zscore_window=getattr(config, "FUNDING_ZSCORE_WINDOW", 30),
+            funding_z_long_max=getattr(config, "FUNDING_ZSCORE_LONG_MAX", 2.0),
+            funding_z_short_min=getattr(config, "FUNDING_ZSCORE_SHORT_MIN", -2.0),
+            oi_lookback=getattr(config, "OI_LOOKBACK_PERIODS", 4),
+            oi_div_pct=getattr(config, "OI_DIVERGENCE_PCT", 0.03),
+            oi_price_move_pct=getattr(config, "OI_PRICE_MOVE_PCT", 0.015),
+            vol_window=getattr(config, "REGIME_VOL_WINDOW", 20),
+            extreme_vol_pct=getattr(config, "REGIME_EXTREME_VOL_PCT", 2.50),
         )
 
     ltf_min = INTERVAL_MINUTES.get(str(interval), 60)
@@ -302,10 +316,18 @@ def prepare_symbol_dataframe(
     benchmark_df: pd.DataFrame = None,
     use_mtf: bool | None = None,
     use_regime: bool | None = None,
+    bench_funding_df: pd.DataFrame | None = None,
+    bench_oi_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, object, int]:
     """Загружает, выравнивает и прогревает данные для бэктеста одной пары."""
     params = strategy_params or {}
-    strat_name = params.get("strategy_name", ACTIVE_STRATEGY).strip().upper()
+    default_strat = (
+        "REGIME_SWITCHER"
+        if getattr(config, "USE_REGIME_SWITCHER", False)
+        and ACTIVE_STRATEGY.upper() not in ("REGIME_SWITCHER", "ADAPTIVE")
+        else ACTIVE_STRATEGY
+    )
+    strat_name = params.get("strategy_name", default_strat).strip().upper()
     if use_mtf is None:
         use_mtf = USE_MTF_FILTER if strat_name != "BB_RSI" else bool(params.get("use_mtf_filter", False))
 
@@ -331,6 +353,14 @@ def prepare_symbol_dataframe(
         use_adx_filter=params.get("use_adx_filter", USE_ADX_FILTER),
         adx_period=params.get("adx_period", ADX_PERIOD),
         adx_threshold=params.get("adx_threshold", ADX_THRESHOLD),
+        adx_trend_min=params.get("adx_trend_min", getattr(config, "SWITCHER_ADX_TREND_MIN", 22.0)),
+        adx_range_max=params.get("adx_range_max", getattr(config, "SWITCHER_ADX_RANGE_MAX", 18.0)),
+        er_period=params.get("er_period", getattr(config, "SWITCHER_ER_PERIOD", 14)),
+        er_trend_min=params.get("er_trend_min", getattr(config, "SWITCHER_ER_TREND_MIN", 0.35)),
+        er_range_max=params.get("er_range_max", getattr(config, "SWITCHER_ER_RANGE_MAX", 0.25)),
+        bb_pctl_window=params.get("bb_pctl_window", getattr(config, "SWITCHER_BB_PCTL_WINDOW", 100)),
+        mr_sl_mult=params.get("mr_sl_mult", getattr(config, "SWITCHER_MR_SL_MULT", 1.8)),
+        mr_tp_mult=params.get("mr_tp_mult", getattr(config, "SWITCHER_MR_TP_MULT", 2.5)),
     )
 
     df = load_or_download(symbol, INTERVAL, days, force_download)
@@ -358,8 +388,21 @@ def prepare_symbol_dataframe(
                 benchmark_df = load_or_download(BENCHMARK_SYMBOL, BENCHMARK_INTERVAL, max(days, 60), force_download)
             except Exception:
                 benchmark_df = None
+        if bench_funding_df is None and getattr(config, "USE_FUNDING_ZSCORE_FILTER", True):
+            try:
+                bench_funding_df = load_or_download_funding(BENCHMARK_SYMBOL, days=max(days, 90), allow_network=False)
+            except Exception:
+                bench_funding_df = None
+        if bench_oi_df is None and getattr(config, "USE_OI_FILTER", True):
+            try:
+                bench_oi_df = load_or_download_open_interest(BENCHMARK_SYMBOL, interval_time=BENCHMARK_INTERVAL, days=min(days, 60), allow_network=False)
+            except Exception:
+                bench_oi_df = None
         if benchmark_df is not None and not benchmark_df.empty:
-            df = align_benchmark_to_ltf(df, benchmark_df, INTERVAL, BENCHMARK_INTERVAL)
+            df = align_benchmark_to_ltf(
+                df, benchmark_df, INTERVAL, BENCHMARK_INTERVAL,
+                funding_df=bench_funding_df, oi_df=bench_oi_df,
+            )
 
     warmup = compute_warmup_bars(strategy, len(df))
     return df, strategy, warmup
@@ -446,8 +489,15 @@ def run_backtest_symbol(
         if np.isnan(atr) or atr <= 0:
             atr = open_price * 0.015
 
-        # 1. Приоритетный выход / разворот по exit_signal ДО фильтра сентимента
-        if exit_sig == 1 and pos_state is not None and not pos_state.is_long:
+        # 1. Приоритетный выход / разворот по exit_signal и Mean-Reversion BB_middle ДО фильтра сентимента
+        mr_close = False
+        if pos_state is not None and getattr(pos_state, "entry_regime", "") == "RANGE":
+            if pos_state.is_long and bool(prev_candle.get("mr_exit_long", False)):
+                mr_close = True
+            elif (not pos_state.is_long) and bool(prev_candle.get("mr_exit_short", False)):
+                mr_close = True
+
+        if (exit_sig == 1 or mr_close) and pos_state is not None and not pos_state.is_long:
             exit_slip = calculate_dynamic_slippage(atr, open_price)
             actual_exit = open_price * (1 + exit_slip)
             fee_pct = (pos_state.entry_price + actual_exit) * TAKER_FEE * LEVERAGE / pos_state.entry_price * 100
@@ -461,13 +511,13 @@ def run_backtest_symbol(
                 "pos_id": pos_id, "symbol": symbol, "type": "short",
                 "entry": pos_state.entry_price, "exit": actual_exit,
                 "pnl_pct": net_pnl, "equity_impact_pct": (usd_delta / initial_equity) * 100.0,
-                "reason": "Сигнал разворота", "bars": i - entry_idx,
+                "reason": "BB_middle (MR)" if mr_close else "Сигнал разворота", "bars": i - entry_idx,
                 "entry_time": df["timestamp"].iloc[entry_idx], "exit_time": candle_time,
             })
             pos_state = None
             entry_idx = None
 
-        elif exit_sig == -1 and pos_state is not None and pos_state.is_long:
+        elif (exit_sig == -1 or mr_close) and pos_state is not None and pos_state.is_long:
             exit_slip = calculate_dynamic_slippage(atr, open_price)
             actual_exit = open_price * (1 - exit_slip)
             fee_pct = (pos_state.entry_price + actual_exit) * TAKER_FEE * LEVERAGE / pos_state.entry_price * 100
@@ -481,7 +531,7 @@ def run_backtest_symbol(
                 "pos_id": pos_id, "symbol": symbol, "type": "long",
                 "entry": pos_state.entry_price, "exit": actual_exit,
                 "pnl_pct": net_pnl, "equity_impact_pct": (usd_delta / initial_equity) * 100.0,
-                "reason": "Сигнал разворота", "bars": i - entry_idx,
+                "reason": "BB_middle (MR)" if mr_close else "Сигнал разворота", "bars": i - entry_idx,
                 "entry_time": df["timestamp"].iloc[entry_idx], "exit_time": candle_time,
             })
             pos_state = None
@@ -506,12 +556,18 @@ def run_backtest_symbol(
             entry_slip = calculate_dynamic_slippage(atr, open_price)
             side_str = "buy" if raw_signal == 1 else "sell"
             entry_p = open_price * (1 + entry_slip if raw_signal == 1 else 1 - entry_slip)
-            stops = strategy.calculate_stops(
-                entry_p, side_str, atr_value=atr,
+            entry_regime = str(prev_candle.get("SIGNAL_REGIME", ""))
+            stop_kw = dict(
                 stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT,
-                atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult,
-                use_atr=USE_ATR_STOPS
+                atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult, use_atr=USE_ATR_STOPS,
             )
+            if entry_regime:
+                try:
+                    stops = strategy.calculate_stops(entry_p, side_str, atr_value=atr, regime=entry_regime, **stop_kw)
+                except TypeError:
+                    stops = strategy.calculate_stops(entry_p, side_str, atr_value=atr, **stop_kw)
+            else:
+                stops = strategy.calculate_stops(entry_p, side_str, atr_value=atr, **stop_kw)
             pos_id += 1
             pos_margin_frac = _calc_position_margin_frac(entry_p, stops["sl_dist"])
             pos_allocated_margin = equity * pos_margin_frac
@@ -524,11 +580,12 @@ def run_backtest_symbol(
                 stop_loss=stops["sl"],
                 take_profit=stops["tp"],
                 atr_value=atr,
-                r_mult=tp1_r_mult
+                r_mult=tp1_r_mult,
+                entry_regime=entry_regime,
             )
             entry_idx = i
 
-        # 4. Внутрисвечевая симуляция (приоритет SL -> TP1 -> TP2 -> обновление BE/Trailing на следующий бар)
+        # 4. Внутрисвечевая симуляция (приоритет SL -> TP1 -> TP2 -> Time-Stop -> BE/Trailing на следующий бар)
         if pos_state is not None:
             closed_reason = None
             exit_price = None
@@ -583,6 +640,24 @@ def run_backtest_symbol(
                     exit_price = pos_state.take_profit
                     closed_reason = "TP2" if pos_state.tp1_executed else "TP"
 
+            if closed_reason is None and params.get("use_time_stop", getattr(config, "USE_TIME_STOP", True)):
+                bar_h = INTERVAL_MINUTES.get(str(INTERVAL), 60) / 60.0
+                ts_act, ts_sl, ts_rsn = pos_state.check_time_stop(
+                    current_price=close_price,
+                    bars_held=int(round((i - entry_idx) * bar_h)),
+                    max_hours=params.get("time_stop_hours", getattr(config, "TIME_STOP_HOURS", 30.0)),
+                    hard_hours=params.get("time_stop_hard_hours", getattr(config, "TIME_STOP_HARD_HOURS", 36.0)),
+                    min_r_progress=params.get("time_stop_min_r", getattr(config, "TIME_STOP_MIN_R", 0.3)),
+                    offset_pct=BREAKEVEN_OFFSET,
+                )
+                if ts_act == "close":
+                    exit_price = close_price
+                    closed_reason = "Time-Stop"
+                elif ts_act == "tighten_be":
+                    pos_state.stop_loss = ts_sl
+                    pos_state.breakeven_applied = True
+                    pos_state.time_stop_tightened = True
+
             if closed_reason and exit_price is not None:
                 is_tp_limit = closed_reason in ("TP", "TP2")
                 exit_slip = 0.0 if is_tp_limit else calculate_dynamic_slippage(atr, exit_price)
@@ -625,7 +700,7 @@ def run_backtest_symbol(
                         pos_state.stop_loss = new_sl
                         pos_state.breakeven_applied = True
 
-                if USE_TRAILING_STOP:
+                if USE_TRAILING_STOP and getattr(pos_state, "entry_regime", "") != "RANGE":
                     trail_updated, new_sl = pos_state.check_trailing_stop(
                         current_price=intra_fav,
                         high_price=high_price,
@@ -720,11 +795,17 @@ def run_portfolio_backtest(
     initial_capital: float = 1000.0,
     use_real_funding: bool = True,
     verbose: bool = True,
+    prepared_override: dict | None = None,
+    funding_map_override: dict | None = None,
+    eval_start_ts: pd.Timestamp | None = None,
+    end_ts: pd.Timestamp | None = None,
 ) -> dict:
     """
-    Синхронный портфельный симулятор по корзине пар с общим капиталом,
-    лимитом открытых позиций (MAX_OPEN_POSITIONS), риск-сайзингом,
-    лимитом однонаправленного риска и компаундингом.
+    Синхронный портфельный симулятор v0.3.0 по корзине пар с общим капиталом:
+    - Aggregate Portfolio Heat Cap + 14-дневный корреляционный скейлинг
+    - Multi-Tier HWM PeakDD Throttle и Loss-Streak Cooldown
+    - Time-Stop и поддержка RegimeSwitcher (Trend <-> Mean-Reversion)
+    - Возможность передачи prepared_override + eval_start_ts/end_ts для быстрого Portfolio WFA
     """
     symbols = symbols or SYMBOLS
     max_pos = max_open_positions if max_open_positions is not None else MAX_OPEN_POSITIONS
@@ -740,60 +821,141 @@ def run_portfolio_backtest(
     use_regime = params.get("use_market_regime_filter", USE_MARKET_REGIME_FILTER)
     tp1_fee_rate = MAKER_FEE if USE_EXCHANGE_TP1 else TAKER_FEE
 
-    bench_df = None
-    if use_regime:
-        try:
-            bench_df = load_or_download(BENCHMARK_SYMBOL, BENCHMARK_INTERVAL, max(days, 60), force_download)
-            if bench_df is not None and not bench_df.empty:
-                bench_df = MarketRegimeFilter.add_indicators(
-                    bench_df,
-                    ema_period=BENCHMARK_EMA_PERIOD,
-                    dump_lookback_candles=BENCHMARK_DUMP_CANDLES,
-                    dump_pct_threshold=BENCHMARK_DUMP_PCT,
-                    pump_pct_threshold=BENCHMARK_PUMP_PCT,
-                    rsi_threshold=BENCHMARK_RSI_THRESHOLD,
-                    bull_rsi_threshold=BENCHMARK_BULL_RSI_THRESHOLD
-                )
-        except Exception:
-            bench_df = None
+    use_port_risk = bool(params.get("use_portfolio_risk_v3", True))
+    max_heat_pct = float(params.get("max_portfolio_heat_pct", getattr(config, "MAX_PORTFOLIO_HEAT_PCT", 0.035)))
+    pr_mgr = PortfolioRiskManager(
+        max_heat_pct=max_heat_pct,
+        use_correlation_scaling=bool(params.get("use_correlation_scaling", getattr(config, "USE_CORRELATION_SCALING", True))),
+        corr_lookback_bars=int(params.get("corr_lookback_bars", getattr(config, "CORR_LOOKBACK_BARS", 336))),
+        corr_threshold=float(params.get("corr_threshold", getattr(config, "CORR_THRESHOLD", 0.75))),
+        corr_risk_scale=float(params.get("corr_risk_scale", getattr(config, "CORR_RISK_SCALE", 0.6))),
+        use_peak_dd_throttle=bool(params.get("use_peak_dd_throttle", getattr(config, "USE_PEAK_DD_THROTTLE", True))),
+        dd_tier1_pct=float(params.get("dd_tier1_pct", getattr(config, "DD_THROTTLE_TIER1_PCT", 0.06))),
+        dd_tier1_mult=float(params.get("dd_tier1_mult", getattr(config, "DD_THROTTLE_TIER1_MULT", 0.5))),
+        dd_tier2_pct=float(params.get("dd_tier2_pct", getattr(config, "DD_THROTTLE_TIER2_PCT", 0.12))),
+        dd_recover_pct=float(params.get("dd_recover_pct", getattr(config, "DD_THROTTLE_RECOVER_PCT", 0.09))),
+        use_loss_cooldown=bool(params.get("use_loss_cooldown", getattr(config, "USE_LOSS_STREAK_COOLDOWN", True))),
+        symbol_loss_limit=int(params.get("loss_streak_symbol_limit", getattr(config, "LOSS_STREAK_SYMBOL_LIMIT", 2))),
+        portfolio_loss_limit=int(params.get("loss_streak_portfolio_limit", getattr(config, "LOSS_STREAK_PORTFOLIO_LIMIT", 3))),
+        cooldown_seconds=float(params.get("loss_streak_cooldown_bars", getattr(config, "LOSS_STREAK_COOLDOWN_BARS", 6))) * INTERVAL_MINUTES.get(str(INTERVAL), 60) * 60.0,
+        peak_equity=float(initial_capital),
+    )
 
     prepared = {}
-    funding_map = {}
+    funding_map = dict(funding_map_override or {})
     bar_maps = {}
     all_timestamps = set()
     common_start = None
 
-    for sym in symbols:
-        df, strategy, warmup = prepare_symbol_dataframe(
-            symbol=sym, days=days, force_download=force_download,
-            strategy_params=params, benchmark_df=bench_df, use_regime=use_regime
-        )
-        if df.empty or len(df) <= warmup + 5:
-            continue
-        prepared[sym] = (df, strategy, warmup)
-        start_ts = df["timestamp"].iloc[warmup]
-        if common_start is None or start_ts > common_start:
-            common_start = start_ts
-        bar_maps[sym] = {ts: idx for idx, ts in enumerate(df["timestamp"])}
-        all_timestamps.update(df["timestamp"].iloc[warmup:].tolist())
-        if use_real_funding:
+    if prepared_override is not None:
+        for sym, tup in prepared_override.items():
+            df, strategy, warmup = tup
+            if df is None or df.empty or len(df) <= warmup + 2:
+                continue
+            prepared[sym] = (df, strategy, warmup)
+            s_ts = df["timestamp"].iloc[warmup]
+            if common_start is None or s_ts > common_start:
+                common_start = s_ts
+            bar_maps[sym] = {ts: idx for idx, ts in enumerate(df["timestamp"])}
+            all_timestamps.update(df["timestamp"].iloc[warmup:].tolist())
+    else:
+        bench_df = None
+        bench_f_df = None
+        bench_o_df = None
+        if use_regime:
             try:
-                funding_map[sym] = load_or_download_funding(sym, days=days, allow_network=False)
+                bench_df = load_or_download(BENCHMARK_SYMBOL, BENCHMARK_INTERVAL, max(days, 60), force_download)
+                if getattr(config, "USE_FUNDING_ZSCORE_FILTER", True):
+                    bench_f_df = load_or_download_funding(BENCHMARK_SYMBOL, days=max(days, 90), allow_network=False)
+                if getattr(config, "USE_OI_FILTER", True):
+                    bench_o_df = load_or_download_open_interest(BENCHMARK_SYMBOL, interval_time=BENCHMARK_INTERVAL, days=min(days, 60), allow_network=False)
+                if bench_df is not None and not bench_df.empty:
+                    bench_df = MarketRegimeFilter.add_indicators(
+                        bench_df,
+                        ema_period=BENCHMARK_EMA_PERIOD,
+                        dump_lookback_candles=BENCHMARK_DUMP_CANDLES,
+                        dump_pct_threshold=BENCHMARK_DUMP_PCT,
+                        pump_pct_threshold=BENCHMARK_PUMP_PCT,
+                        rsi_threshold=BENCHMARK_RSI_THRESHOLD,
+                        bull_rsi_threshold=BENCHMARK_BULL_RSI_THRESHOLD,
+                        fast_ema_period=getattr(config, "REGIME_FAST_EMA_PERIOD", 50),
+                        use_hybrid_trend=getattr(config, "REGIME_USE_HYBRID_TREND", True),
+                        funding_df=bench_f_df,
+                        oi_df=bench_o_df,
+                        funding_zscore_window=getattr(config, "FUNDING_ZSCORE_WINDOW", 30),
+                        funding_z_long_max=getattr(config, "FUNDING_ZSCORE_LONG_MAX", 2.0),
+                        funding_z_short_min=getattr(config, "FUNDING_ZSCORE_SHORT_MIN", -2.0),
+                        oi_lookback=getattr(config, "OI_LOOKBACK_PERIODS", 4),
+                        oi_div_pct=getattr(config, "OI_DIVERGENCE_PCT", 0.03),
+                        oi_price_move_pct=getattr(config, "OI_PRICE_MOVE_PCT", 0.015),
+                        vol_window=getattr(config, "REGIME_VOL_WINDOW", 20),
+                        extreme_vol_pct=getattr(config, "REGIME_EXTREME_VOL_PCT", 2.50),
+                    )
             except Exception:
-                funding_map[sym] = None
+                bench_df = None
+
+        for sym in symbols:
+            df, strategy, warmup = prepare_symbol_dataframe(
+                symbol=sym, days=days, force_download=force_download,
+                strategy_params=params, benchmark_df=bench_df, use_regime=use_regime,
+                bench_funding_df=bench_f_df, bench_oi_df=bench_o_df,
+            )
+            if df.empty or len(df) <= warmup + 5:
+                continue
+            prepared[sym] = (df, strategy, warmup)
+            s_ts = df["timestamp"].iloc[warmup]
+            if common_start is None or s_ts > common_start:
+                common_start = s_ts
+            bar_maps[sym] = {ts: idx for idx, ts in enumerate(df["timestamp"])}
+            all_timestamps.update(df["timestamp"].iloc[warmup:].tolist())
+            if use_real_funding and sym not in funding_map:
+                try:
+                    funding_map[sym] = load_or_download_funding(sym, days=days, allow_network=False)
+                except Exception:
+                    funding_map[sym] = None
 
     if not prepared or not all_timestamps:
         return {"symbols": [], "trades": 0, "pnl_pct": 0.0, "max_drawdown": 0.0, "sharpe_ratio": 0.0, "profit_factor": 0.0, "win_rate": 0.0, "tdf": pd.DataFrame()}
 
-    timeline = sorted(ts for ts in all_timestamps if common_start is None or ts >= common_start)
+    if eval_start_ts is not None and common_start is not None:
+        eff_start = max(common_start, eval_start_ts)
+    else:
+        eff_start = eval_start_ts if eval_start_ts is not None else common_start
+    timeline = sorted(
+        ts for ts in all_timestamps
+        if (eff_start is None or ts >= eff_start) and (end_ts is None or ts <= end_ts)
+    )
+    if not timeline:
+        return {"symbols": list(prepared.keys()), "trades": 0, "pnl_pct": 0.0, "max_drawdown": 0.0, "sharpe_ratio": 0.0, "profit_factor": 0.0, "win_rate": 0.0, "tdf": pd.DataFrame()}
+
     equity = float(initial_capital)
-    open_pos: dict[str, dict] = {}  # sym -> {"risk": PositionRiskState, "margin": float, "entry_time": ts, "pos_id": int}
+    open_pos: dict[str, dict] = {}
     trades = []
     pos_id = 0
     equity_timeline = [(timeline[0], equity)]
+    use_ts = bool(params.get("use_time_stop", getattr(config, "USE_TIME_STOP", True)))
+    ts_hours = float(params.get("time_stop_hours", getattr(config, "TIME_STOP_HOURS", 30.0)))
+    ts_hard = float(params.get("time_stop_hard_hours", getattr(config, "TIME_STOP_HARD_HOURS", 36.0)))
+    ts_min_r = float(params.get("time_stop_min_r", getattr(config, "TIME_STOP_MIN_R", 0.3)))
+    bar_h = INTERVAL_MINUTES.get(str(INTERVAL), 60) / 60.0
+
+    def _compute_portfolio_heat_pct() -> float:
+        if equity <= 0 or not open_pos:
+            return 0.0
+        total_risk_u = 0.0
+        for p in open_pos.values():
+            st_p: PositionRiskState = p["risk"]
+            if st_p.is_risk_free() or st_p.entry_price <= 0 or st_p.stop_loss <= 0:
+                continue
+            dist = (st_p.entry_price - st_p.stop_loss) if st_p.is_long else (st_p.stop_loss - st_p.entry_price)
+            if dist > 0:
+                notional = float(p["margin"]) * LEVERAGE * (st_p.size / st_p.initial_size)
+                total_risk_u += notional * (dist / st_p.entry_price)
+        return max(0.0, total_risk_u / equity)
 
     for ts in timeline:
-        # 1. Выходы по сигналам разворота на открытии бара
+        ts_epoch = float(pd.Timestamp(ts).timestamp())
+        # 1. Выходы по сигналам разворота и Mean-Reversion BB_middle на открытии бара
         for sym in list(open_pos.keys()):
             idx = bar_maps[sym].get(ts)
             if idx is None or idx < 1:
@@ -810,7 +972,12 @@ def run_portfolio_backtest(
 
             p_info = open_pos[sym]
             st: PositionRiskState = p_info["risk"]
-            if (exit_sig == 1 and not st.is_long) or (exit_sig == -1 and st.is_long):
+            mr_close = False
+            if getattr(st, "entry_regime", "") == "RANGE":
+                if (st.is_long and bool(prev.get("mr_exit_long", False))) or (not st.is_long and bool(prev.get("mr_exit_short", False))):
+                    mr_close = True
+
+            if (exit_sig == 1 and not st.is_long) or (exit_sig == -1 and st.is_long) or mr_close:
                 slip = calculate_dynamic_slippage(atr, open_p)
                 actual_exit = open_p * (1 + slip if not st.is_long else 1 - slip)
                 pnl_raw = ((st.entry_price - actual_exit) if not st.is_long else (actual_exit - st.entry_price)) / st.entry_price * LEVERAGE * 100
@@ -818,12 +985,17 @@ def run_portfolio_backtest(
                 fund_pct = compute_funding_cost_pct(p_info["entry_time"], ts, st.is_long, LEVERAGE, funding_map.get(sym))
                 weight = st.size / st.initial_size
                 net_pnl = (pnl_raw - fee_pct - fund_pct) * weight
-                equity = max(1.0, equity + p_info["margin"] * (net_pnl / 100.0))
+                usd_delta = p_info["margin"] * (net_pnl / 100.0)
+                equity = max(1.0, equity + usd_delta)
+                total_pos_usd = usd_delta + float(p_info.get("tp1_usd", 0.0))
+                pr_mgr.record_closed_trade(sym, total_pos_usd, now_ts=ts_epoch)
+                pr_mgr.update_equity(equity, valid=True)
                 trades.append({
                     "pos_id": p_info["pos_id"], "symbol": sym,
                     "type": "long" if st.is_long else "short",
                     "entry": st.entry_price, "exit": actual_exit,
-                    "pnl_pct": net_pnl, "reason": "Сигнал разворота",
+                    "pnl_pct": net_pnl, "usd_delta": usd_delta,
+                    "reason": "BB_middle (MR)" if mr_close else "Сигнал разворота",
                     "entry_time": p_info["entry_time"], "exit_time": ts,
                 })
                 del open_pos[sym]
@@ -831,6 +1003,8 @@ def run_portfolio_backtest(
         # 2. Открытие новых позиций на открытии бара
         used_margin = sum(p["margin"] * (p["risk"].size / p["risk"].initial_size) for p in open_pos.values())
         free_margin = max(0.0, equity - used_margin)
+        dd_snap = pr_mgr.update_equity(equity, valid=True)
+
         for sym, (df, strategy, warmup) in prepared.items():
             if sym in open_pos:
                 continue
@@ -855,7 +1029,6 @@ def run_portfolio_backtest(
                 if col not in df.columns or pd.isna(prev.get(col)) or not bool(prev.get(col)):
                     continue
 
-            # Лимит однонаправленного коррелированного риска
             same_dir_cnt = sum(
                 1 for p in open_pos.values()
                 if (raw_sig == 1 and p["risk"].is_long) or (raw_sig == -1 and not p["risk"].is_long)
@@ -869,12 +1042,51 @@ def run_portfolio_backtest(
                 atr = open_p * 0.015
             slip = calculate_dynamic_slippage(atr, open_p)
             entry_p = open_p * (1 + slip if raw_sig == 1 else 1 - slip)
-            stops = strategy.calculate_stops(
-                entry_p, "buy" if raw_sig == 1 else "sell", atr_value=atr,
+            entry_regime = str(prev.get("SIGNAL_REGIME", ""))
+            stop_kw = dict(
                 stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT,
-                atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult, use_atr=USE_ATR_STOPS
+                atr_sl_mult=atr_sl_mult, atr_tp_mult=atr_tp_mult, use_atr=USE_ATR_STOPS,
             )
-            margin_frac = _calc_position_margin_frac(entry_p, stops["sl_dist"])
+            if entry_regime:
+                try:
+                    stops = strategy.calculate_stops(entry_p, "buy" if raw_sig == 1 else "sell", atr_value=atr, regime=entry_regime, **stop_kw)
+                except TypeError:
+                    stops = strategy.calculate_stops(entry_p, "buy" if raw_sig == 1 else "sell", atr_value=atr, **stop_kw)
+            else:
+                stops = strategy.calculate_stops(entry_p, "buy" if raw_sig == 1 else "sell", atr_value=atr, **stop_kw)
+
+            risk_pct_eff = RISK_PER_TRADE_PCT
+            cap_pct_eff = POSITION_SIZE_PCT
+            if use_port_risk:
+                if pr_mgr.use_loss_cooldown:
+                    if pr_mgr.portfolio_cooldown_until > ts_epoch or float(pr_mgr.symbol_cooldown_until.get(sym.upper(), 0.0)) > ts_epoch:
+                        continue
+                if dd_snap["drawdown_pause"]:
+                    continue
+
+                # Корреляция строго по прошлым барам (< idx) — без lookahead!
+                k_map_bt = {}
+                if pr_mgr.use_correlation_scaling and open_pos:
+                    lb = pr_mgr.corr_lookback_bars
+                    k_map_bt[sym] = df.iloc[max(0, idx - lb):idx]
+                    for op_sym in open_pos:
+                        op_idx = bar_maps[op_sym].get(ts)
+                        if op_idx is not None and op_idx > 20:
+                            op_df, _, _ = prepared[op_sym]
+                            k_map_bt[op_sym] = op_df.iloc[max(0, op_idx - lb):op_idx]
+
+                corr_scale, _ = pr_mgr.compute_correlation_scale(
+                    sym, (raw_sig == 1), {k: v["risk"] for k, v in open_pos.items()}, k_map_bt
+                )
+                scale_mult = float(dd_snap["risk_scale"]) * float(corr_scale)
+                open_heat = _compute_portfolio_heat_pct()
+                rem_heat = max(0.0, pr_mgr.max_heat_pct - open_heat)
+                if rem_heat < RISK_PER_TRADE_PCT * 0.35:
+                    continue
+                risk_pct_eff = min(RISK_PER_TRADE_PCT * scale_mult, rem_heat)
+                cap_pct_eff = POSITION_SIZE_PCT * scale_mult
+
+            margin_frac = _calc_position_margin_frac(entry_p, stops["sl_dist"], risk_pct=risk_pct_eff, cap_pct=cap_pct_eff)
             margin = min(free_margin * 0.95, equity * margin_frac)
             if margin < 5.0:
                 continue
@@ -884,16 +1096,19 @@ def run_portfolio_backtest(
                 "pos_id": pos_id,
                 "margin": margin,
                 "entry_time": ts,
+                "entry_bar_idx": idx,
+                "tp1_usd": 0.0,
                 "risk": PositionRiskState(
                     symbol=sym, side="Buy" if raw_sig == 1 else "Sell",
                     entry_price=entry_p, size=1.0, initial_size=1.0,
                     stop_loss=stops["sl"], take_profit=stops["tp"],
-                    atr_value=atr, r_mult=tp1_r_mult
+                    atr_value=atr, r_mult=tp1_r_mult,
+                    entry_regime=entry_regime,
                 )
             }
             free_margin = max(0.0, free_margin - margin)
 
-        # 3. Внутрисвечевая симуляция SL -> TP1 -> TP2 -> BE/Trailing
+        # 3. Внутрисвечевая симуляция SL -> TP1 -> TP2 -> Time-Stop -> BE/Trailing
         for sym in list(open_pos.keys()):
             idx = bar_maps[sym].get(ts)
             if idx is None:
@@ -902,7 +1117,8 @@ def run_portfolio_backtest(
             candle = df.iloc[idx]
             high_p = float(candle["high"])
             low_p = float(candle["low"])
-            atr = float(candle.get("ATR", 0.0)) or (float(candle["close"]) * 0.015)
+            close_p = float(candle["close"])
+            atr = float(candle.get("ATR", 0.0)) or (close_p * 0.015)
 
             p_info = open_pos[sym]
             st: PositionRiskState = p_info["risk"]
@@ -927,12 +1143,15 @@ def run_portfolio_backtest(
                         pnl_raw = ((tp1_p - st.entry_price) if st.is_long else (st.entry_price - tp1_p)) / st.entry_price * LEVERAGE * 100
                         fund_pct = compute_funding_cost_pct(p_info["entry_time"], ts, st.is_long, LEVERAGE, funding_map.get(sym))
                         net_pnl = (pnl_raw - fee_pct - fund_pct) * PARTIAL_TP_RATIO
-                        equity = max(1.0, equity + p_info["margin"] * (net_pnl / 100.0))
+                        tp1_usd = p_info["margin"] * (net_pnl / 100.0)
+                        equity = max(1.0, equity + tp1_usd)
+                        p_info["tp1_usd"] = float(p_info.get("tp1_usd", 0.0)) + tp1_usd
                         trades.append({
                             "pos_id": p_info["pos_id"], "symbol": sym,
                             "type": "long" if st.is_long else "short",
                             "entry": st.entry_price, "exit": tp1_p,
-                            "pnl_pct": net_pnl, "reason": f"TP1 ({tp1_r_mult:g}R)",
+                            "pnl_pct": net_pnl, "usd_delta": tp1_usd,
+                            "reason": f"TP1 ({tp1_r_mult:g}R)",
                             "entry_time": p_info["entry_time"], "exit_time": ts,
                         })
                         st.tp1_executed = True
@@ -949,6 +1168,24 @@ def run_portfolio_backtest(
                     exit_price = st.take_profit
                     closed_reason = "TP2" if st.tp1_executed else "TP"
 
+            if closed_reason is None and use_ts:
+                bars_held = max(0, idx - int(p_info.get("entry_bar_idx", idx)))
+                ts_act, ts_sl, _ = st.check_time_stop(
+                    current_price=close_p,
+                    bars_held=int(round(bars_held * bar_h)),
+                    max_hours=ts_hours,
+                    hard_hours=ts_hard,
+                    min_r_progress=ts_min_r,
+                    offset_pct=BREAKEVEN_OFFSET,
+                )
+                if ts_act == "close":
+                    exit_price = close_p
+                    closed_reason = "Time-Stop"
+                elif ts_act == "tighten_be":
+                    st.stop_loss = ts_sl
+                    st.breakeven_applied = True
+                    st.time_stop_tightened = True
+
             if closed_reason and exit_price is not None:
                 is_tp_lim = closed_reason in ("TP", "TP2")
                 slip = 0.0 if is_tp_lim else calculate_dynamic_slippage(atr, exit_price)
@@ -958,12 +1195,17 @@ def run_portfolio_backtest(
                 fund_pct = compute_funding_cost_pct(p_info["entry_time"], ts, st.is_long, LEVERAGE, funding_map.get(sym))
                 weight = st.size / st.initial_size
                 net_pnl = (pnl_raw - fee_pct - fund_pct) * weight
-                equity = max(1.0, equity + p_info["margin"] * (net_pnl / 100.0))
+                usd_delta = p_info["margin"] * (net_pnl / 100.0)
+                equity = max(1.0, equity + usd_delta)
+                total_pos_usd = usd_delta + float(p_info.get("tp1_usd", 0.0))
+                pr_mgr.record_closed_trade(sym, total_pos_usd, now_ts=ts_epoch)
+                pr_mgr.update_equity(equity, valid=True)
                 trades.append({
                     "pos_id": p_info["pos_id"], "symbol": sym,
                     "type": "long" if st.is_long else "short",
                     "entry": st.entry_price, "exit": actual_exit,
-                    "pnl_pct": net_pnl, "reason": closed_reason,
+                    "pnl_pct": net_pnl, "usd_delta": usd_delta,
+                    "reason": closed_reason,
                     "entry_time": p_info["entry_time"], "exit_time": ts,
                 })
                 del open_pos[sym]
@@ -975,7 +1217,7 @@ def run_portfolio_backtest(
                     if be_upd:
                         st.stop_loss = new_sl
                         st.breakeven_applied = True
-                if USE_TRAILING_STOP:
+                if USE_TRAILING_STOP and getattr(st, "entry_regime", "") != "RANGE":
                     tr_upd, new_sl = st.check_trailing_stop(
                         intra_fav, high_p, low_p, TRAILING_STOP_TRIGGER, trailing_atr_mult, TRAILING_STOP_FALLBACK, trail_r_mult
                     )
@@ -995,12 +1237,17 @@ def run_portfolio_backtest(
             mtm_eq += p_info["margin"] * (diff / st.entry_price) * LEVERAGE * (st.size / st.initial_size)
         equity_timeline.append((ts, max(1.0, mtm_eq)))
 
-    # MTM-закрытие оставшихся открытых позиций на конце истории
+    # MTM-закрытие оставшихся открытых позиций на конце окна (без lookahead за last_ts!)
     last_ts = timeline[-1]
     open_mtm_count = len(open_pos)
     for sym, p_info in list(open_pos.items()):
         df, _, _ = prepared[sym]
-        last_c = df.iloc[-1]
+        last_idx = bar_maps[sym].get(last_ts)
+        if last_idx is None:
+            sub = df[df["timestamp"] <= last_ts]
+            last_c = sub.iloc[-1] if not sub.empty else df.iloc[-1]
+        else:
+            last_c = df.iloc[last_idx]
         last_close = float(last_c["close"])
         last_atr = float(last_c.get("ATR", 0.0)) or (last_close * 0.015)
         st = p_info["risk"]
@@ -1011,12 +1258,14 @@ def run_portfolio_backtest(
         fund_pct = compute_funding_cost_pct(p_info["entry_time"], last_c["timestamp"], st.is_long, LEVERAGE, funding_map.get(sym))
         weight = st.size / st.initial_size
         net_pnl = (pnl_raw - fee_pct - fund_pct) * weight
-        equity = max(1.0, equity + p_info["margin"] * (net_pnl / 100.0))
+        usd_delta = p_info["margin"] * (net_pnl / 100.0)
+        equity = max(1.0, equity + usd_delta)
         trades.append({
             "pos_id": p_info["pos_id"], "symbol": sym,
             "type": "long" if st.is_long else "short",
             "entry": st.entry_price, "exit": actual_exit,
-            "pnl_pct": net_pnl, "reason": "MTM (Конец периода)",
+            "pnl_pct": net_pnl, "usd_delta": usd_delta,
+            "reason": "MTM (Конец периода)",
             "entry_time": p_info["entry_time"], "exit_time": last_c["timestamp"],
         })
     equity_timeline[-1] = (last_ts, equity)
@@ -1055,6 +1304,8 @@ def run_backtest(days: int = 90, force_download: bool = False, target_symbol: st
     if USE_MARKET_REGIME_FILTER:
         try:
             bench_df = load_or_download(BENCHMARK_SYMBOL, BENCHMARK_INTERVAL, max(days, 60), force_download)
+            bench_f_df = load_or_download_funding(BENCHMARK_SYMBOL, days=max(days, 90), allow_network=False) if getattr(config, "USE_FUNDING_ZSCORE_FILTER", True) else None
+            bench_o_df = load_or_download_open_interest(BENCHMARK_SYMBOL, interval_time=BENCHMARK_INTERVAL, days=min(days, 60), allow_network=False) if getattr(config, "USE_OI_FILTER", True) else None
             if bench_df is not None and not bench_df.empty:
                 bench_df = MarketRegimeFilter.add_indicators(
                     bench_df,
@@ -1063,7 +1314,19 @@ def run_backtest(days: int = 90, force_download: bool = False, target_symbol: st
                     dump_pct_threshold=BENCHMARK_DUMP_PCT,
                     pump_pct_threshold=BENCHMARK_PUMP_PCT,
                     rsi_threshold=BENCHMARK_RSI_THRESHOLD,
-                    bull_rsi_threshold=BENCHMARK_BULL_RSI_THRESHOLD
+                    bull_rsi_threshold=BENCHMARK_BULL_RSI_THRESHOLD,
+                    fast_ema_period=getattr(config, "REGIME_FAST_EMA_PERIOD", 50),
+                    use_hybrid_trend=getattr(config, "REGIME_USE_HYBRID_TREND", True),
+                    funding_df=bench_f_df,
+                    oi_df=bench_o_df,
+                    funding_zscore_window=getattr(config, "FUNDING_ZSCORE_WINDOW", 30),
+                    funding_z_long_max=getattr(config, "FUNDING_ZSCORE_LONG_MAX", 2.0),
+                    funding_z_short_min=getattr(config, "FUNDING_ZSCORE_SHORT_MIN", -2.0),
+                    oi_lookback=getattr(config, "OI_LOOKBACK_PERIODS", 4),
+                    oi_div_pct=getattr(config, "OI_DIVERGENCE_PCT", 0.03),
+                    oi_price_move_pct=getattr(config, "OI_PRICE_MOVE_PCT", 0.015),
+                    vol_window=getattr(config, "REGIME_VOL_WINDOW", 20),
+                    extreme_vol_pct=getattr(config, "REGIME_EXTREME_VOL_PCT", 2.50),
                 )
         except Exception:
             bench_df = None

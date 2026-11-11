@@ -7,6 +7,8 @@
 """
 
 from typing import Any, Optional
+import csv
+import io
 import json
 import os
 import re
@@ -16,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+from storage import BotDatabase
 
 _STATE_LOCK = threading.RLock()
 _BOT_INSTANCE: Optional[Any] = None
@@ -61,25 +64,126 @@ def _safe_read_json(path) -> dict:
 
 def write_control_state(
     is_paused: Optional[bool] = None,
-    trading_mode: Optional[str] = None
-):
-    """Атомарно сохраняет состояние управления (пауза, режим) для синхронизации между bot.py и dashboard.py."""
+    trading_mode: Optional[str] = None,
+    pending_shadow_panic: Optional[bool] = None,
+    pending_shadow_closes: Optional[list[str]] = None,
+) -> float:
+    """Атомарно сохраняет состояние управления (пауза, режим, shadow-действия) для синхронизации между bot.py и dashboard.py."""
     global _LAST_CONTROL_WRITE_TS
     with _STATE_LOCK:
         cur = _safe_read_json(config.CONTROL_FILE)
-        now = time.time()
+        prev_ts = float(cur.get("updated_at") or 0.0)
+        now = max(time.time(), prev_ts + 1e-6, _LAST_CONTROL_WRITE_TS + 1e-6)
         if is_paused is not None:
             cur["is_paused"] = bool(is_paused)
         if trading_mode is not None:
             cur["trading_mode"] = str(trading_mode).strip().upper()
+        if pending_shadow_panic is not None:
+            if pending_shadow_panic:
+                cur["pending_shadow_panic"] = True
+            else:
+                cur.pop("pending_shadow_panic", None)
+        if pending_shadow_closes is not None:
+            cleaned = [str(s).strip().upper() for s in pending_shadow_closes if str(s).strip()]
+            if cleaned:
+                cur["pending_shadow_closes"] = list(dict.fromkeys(cleaned))
+            else:
+                cur.pop("pending_shadow_closes", None)
         cur["updated_at"] = now
         _LAST_CONTROL_WRITE_TS = now
         _atomic_write_json(config.CONTROL_FILE, cur)
+        return now
+
+
+def enqueue_shadow_close(symbol: str) -> float:
+    """Атомарно добавляет символ в очередь закрытия shadow-позиций для процесса bot.py."""
+    sym = str(symbol or "").strip().upper()
+    with _STATE_LOCK:
+        cur = _safe_read_json(config.CONTROL_FILE)
+        existing = cur.get("pending_shadow_closes")
+        lst = list(existing) if isinstance(existing, list) else []
+        if sym and sym not in lst:
+            lst.append(sym)
+        return write_control_state(pending_shadow_closes=lst)
+
+
+def consume_shadow_control_actions() -> tuple[bool, list[str], float]:
+    """Атомарно извлекает и очищает отложенные shadow-команды (panic / close) из файла управления IPC."""
+    global _LAST_CONTROL_WRITE_TS
+    with _STATE_LOCK:
+        cur = _safe_read_json(config.CONTROL_FILE)
+        pending_panic = bool(cur.get("pending_shadow_panic", False))
+        raw_closes = cur.get("pending_shadow_closes")
+        pending_closes = (
+            list(dict.fromkeys(str(s).strip().upper() for s in raw_closes if str(s).strip()))
+            if isinstance(raw_closes, list)
+            else []
+        )
+        if not pending_panic and not pending_closes:
+            return False, [], float(cur.get("updated_at") or 0.0)
+        prev_ts = float(cur.get("updated_at") or 0.0)
+        now = max(time.time(), prev_ts + 1e-6, _LAST_CONTROL_WRITE_TS + 1e-6)
+        cur.pop("pending_shadow_panic", None)
+        cur.pop("pending_shadow_closes", None)
+        cur["updated_at"] = now
+        _LAST_CONTROL_WRITE_TS = now
+        _atomic_write_json(config.CONTROL_FILE, cur)
+        return pending_panic, pending_closes, now
 
 
 def read_control_state() -> dict:
     """Читает файл управления для синхронизации standalone dashboard.py и bot.py."""
     return _safe_read_json(config.CONTROL_FILE)
+
+
+def write_control_action(action: str, symbol: Optional[str] = None) -> dict:
+    """Помещает отложенную команду (close_position / panic_close_all) в файл управления IPC."""
+    global _LAST_CONTROL_WRITE_TS
+    act_name = str(action or "").strip().lower()
+    sym_u = str(symbol or "").strip().upper()
+    with _STATE_LOCK:
+        cur = _safe_read_json(config.CONTROL_FILE)
+        now = time.time()
+        actions = cur.get("pending_actions")
+        if not isinstance(actions, list):
+            actions = []
+        updated_existing = False
+        for item in actions:
+            if isinstance(item, dict) and item.get("action") == act_name and str(item.get("symbol") or "").upper() == sym_u:
+                item["ts"] = now
+                entry = item
+                updated_existing = True
+                break
+        if not updated_existing:
+            entry = {
+                "id": f"{act_name}:{sym_u}:{int(now * 1000)}",
+                "action": act_name,
+                "symbol": sym_u,
+                "ts": now,
+            }
+            actions.append(entry)
+        cur["pending_actions"] = actions[-50:]
+        cur["updated_at"] = now
+        _LAST_CONTROL_WRITE_TS = now
+        _atomic_write_json(config.CONTROL_FILE, cur)
+        return dict(entry)
+
+
+def consume_control_actions() -> tuple[list[dict], float]:
+    """Атомарно извлекает и очищает очередь отложенных команд из файла управления."""
+    global _LAST_CONTROL_WRITE_TS
+    with _STATE_LOCK:
+        cur = _safe_read_json(config.CONTROL_FILE)
+        actions = cur.get("pending_actions")
+        if not isinstance(actions, list) or not actions:
+            return [], float(cur.get("updated_at") or 0.0)
+        consumed = [dict(a) for a in actions if isinstance(a, dict)]
+        now = time.time()
+        cur["pending_actions"] = []
+        cur["updated_at"] = now
+        _LAST_CONTROL_WRITE_TS = now
+        _atomic_write_json(config.CONTROL_FILE, cur)
+        return consumed, now
 
 
 def write_live_status(snapshot: dict):
@@ -98,6 +202,11 @@ def read_live_status(max_age_sec: float = 120.0) -> dict:
     if ts > 0 and (time.time() - ts) <= max_age_sec:
         return data
     return {}
+
+
+def is_bot_live(max_age_sec: float = 120.0) -> bool:
+    """True, если процесс bot.py недавно публиковал живой срез состояния."""
+    return bool(read_live_status(max_age_sec=max_age_sec))
 
 
 def is_bot_paused() -> bool:
@@ -314,3 +423,161 @@ def parse_equity_history(
     if len(points) > max_points:
         points = points[-max_points:]
     return points
+
+
+# ==============================================================================
+# v0.3.0: SQLite Storage + Fallback Helpers + Analytics + CSV/JSON Export
+# ==============================================================================
+
+def _db_exists() -> bool:
+    try:
+        db_file = Path(getattr(config, "DB_FILE", ""))
+        return bool(str(db_file)) and db_file.exists()
+    except Exception:
+        return False
+
+
+def get_trade_history(
+    limit: int = 60,
+    include_shadow: bool = False,
+    only_shadow: bool = False,
+    symbol: Optional[str] = None,
+) -> list[dict]:
+    """Читает историю сделок из SQLite с безопасным fallback на trade.log."""
+    if _db_exists():
+        try:
+            rows = BotDatabase().get_trades(
+                limit=limit,
+                include_shadow=include_shadow,
+                only_shadow=only_shadow,
+                symbol=symbol,
+            )
+            if rows:
+                return rows
+        except Exception:
+            pass
+
+    if only_shadow:
+        return []
+
+    fallback = parse_trade_log(limit=limit)
+    if symbol:
+        sym_u = symbol.strip().upper()
+        fallback = [r for r in fallback if str(r.get("symbol", "")).upper() == sym_u]
+    return fallback
+
+
+def get_equity_curve(
+    initial_balance: float = 1000.0,
+    max_points: int = 200,
+    margin_weight: float = 0.25,
+    is_shadow: bool = False,
+) -> list[dict]:
+    """Возвращает кривую капитала из SQLite с fallback на парсинг trade.log."""
+    if _db_exists():
+        try:
+            pts = BotDatabase().get_equity_history(limit=max_points, is_shadow=is_shadow)
+            if pts:
+                return pts
+        except Exception:
+            pass
+
+    if is_shadow:
+        return [{"time": int(time.time()), "value": round(float(initial_balance), 2)}]
+    return parse_equity_history(
+        initial_balance=initial_balance,
+        max_points=max_points,
+        margin_weight=margin_weight,
+    )
+
+
+def get_analytics_summary(is_shadow: bool = False, limit: int = 2000) -> dict:
+    """Агрегированная аналитика по сделкам, монетам, стратегиям и детектору деградации."""
+    summary: Optional[dict] = None
+    if _db_exists():
+        try:
+            summary = BotDatabase().get_analytics_summary(is_shadow=is_shadow, limit=limit)
+        except Exception:
+            summary = None
+
+    if summary is None:
+        summary = {
+            "is_shadow": bool(is_shadow),
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "total_net_pnl_usdt": 0.0,
+            "total_fees_usdt": 0.0,
+            "total_funding_usdt": 0.0,
+            "avg_pnl_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "by_symbol": {},
+            "by_strategy": {},
+        }
+        if not is_shadow:
+            legacy = parse_trade_log(limit=min(limit, 500))
+            closed = [t for t in legacy if t.get("is_profit") is not None]
+            if closed:
+                wins = sum(1 for t in closed if t.get("is_profit") is True)
+                summary["total_trades"] = len(closed)
+                summary["wins"] = wins
+                summary["losses"] = len(closed) - wins
+                summary["win_rate"] = round(wins / len(closed) * 100.0, 2)
+
+    try:
+        from optimizer import load_strategy_profile, detect_live_degradation
+        raw_strat = (
+            getattr(config, "SHADOW_STRATEGY", None) or getattr(config, "ACTIVE_STRATEGY", "SUPERTREND_PRO")
+            if is_shadow
+            else getattr(config, "ACTIVE_STRATEGY", "SUPERTREND_PRO")
+        )
+        use_switcher = getattr(config, "USE_REGIME_SWITCHER", False)
+        if (
+            (not is_shadow or not getattr(config, "SHADOW_STRATEGY", ""))
+            and use_switcher
+            and str(raw_strat).strip().upper() not in ("REGIME_SWITCHER", "ADAPTIVE")
+        ):
+            strat_name = "REGIME_SWITCHER"
+        else:
+            strat_name = str(raw_strat).strip().upper()
+        profile = load_strategy_profile(strat_name)
+        summary["degradation"] = detect_live_degradation(summary, profile=profile)
+    except Exception:
+        summary["degradation"] = {"status": "INSUFFICIENT_DATA", "degraded": False, "reasons": []}
+
+    return summary
+
+
+def export_trades_csv(limit: int = 1000, include_shadow: bool = False) -> str:
+    """Экспортирует историю сделок в CSV из SQLite (или fallback trade.log)."""
+    if _db_exists():
+        try:
+            db = BotDatabase()
+            if db.get_trades(limit=1, include_shadow=include_shadow):
+                return db.export_trades_csv(limit=limit, include_shadow=include_shadow)
+        except Exception:
+            pass
+
+    rows = parse_trade_log(limit=limit)
+    buf = io.StringIO()
+    fields = ["timestamp", "symbol", "action", "price", "pnl", "is_profit", "details"]
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+    return buf.getvalue()
+
+
+def export_trades_json(limit: int = 1000, include_shadow: bool = False) -> list[dict]:
+    """Экспортирует историю сделок в JSON-список из SQLite (или fallback trade.log)."""
+    if _db_exists():
+        try:
+            db = BotDatabase()
+            rows = db.export_trades_json(limit=limit, include_shadow=include_shadow)
+            if rows:
+                return rows
+        except Exception:
+            pass
+    return parse_trade_log(limit=limit)

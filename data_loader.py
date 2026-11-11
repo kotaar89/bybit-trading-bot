@@ -337,6 +337,132 @@ def load_or_download_funding(
     return pd.DataFrame()
 
 
+def download_open_interest_history(
+    symbol: str = None,
+    interval_time: str = "1h",
+    days: int = 30,
+    save_csv: bool = True,
+    show_progress: bool = False
+) -> pd.DataFrame:
+    """
+    Скачивает историю Open Interest с Bybit v5 API (/v5/market/open-interest).
+    interval_time: '5min', '15min', '30min', '1h', '4h', '1d'.
+    """
+    symbol = symbol or SYMBOL
+    interval_map = {
+        "5": "5min", "15": "15min", "30": "30min",
+        "60": "1h", "240": "4h", "D": "1d",
+        "5min": "5min", "15min": "15min", "30min": "30min",
+        "1h": "1h", "4h": "4h", "1d": "1d",
+    }
+    iv = interval_map.get(str(interval_time), "1h")
+
+    client = HTTP(
+        testnet=TESTNET,
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        demo=DEMO,
+        timeout=10,
+        max_retries=2,
+    )
+
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    all_rows = []
+    cursor = None
+    consecutive_errors = 0
+
+    for _ in range(15):
+        params = dict(category="linear", symbol=symbol, intervalTime=iv, limit=200)
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = client.get_open_interest(**params)
+            if resp.get("retCode", 0) != 0:
+                raise RuntimeError(f"Bybit retCode={resp.get('retCode')}: {resp.get('retMsg')}")
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            if show_progress:
+                print(f"Ошибка загрузки OI {symbol}: {e}")
+            if consecutive_errors >= 2:
+                break
+            time.sleep(0.5)
+            continue
+
+        result = resp.get("result", {}) or {}
+        batch = result.get("list", [])
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        oldest_ts = min(int(item["timestamp"]) for item in batch)
+        cursor = result.get("nextPageCursor")
+        if oldest_ts <= cutoff_ms or not cursor or len(batch) < 200:
+            break
+        time.sleep(0.1)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms")
+    df["openInterest"] = df["openInterest"].astype(float)
+    df = df[["timestamp", "openInterest"]].drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
+    cutoff_dt = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    df = df[df["timestamp"] >= pd.Timestamp(cutoff_dt)].reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame()
+
+    if save_csv:
+        data_dir = config.DATA_DIR
+        os.makedirs(data_dir, exist_ok=True)
+        filename = data_dir / f"{symbol}_oi_{iv}_{days}d.csv"
+        tmp_file = filename.with_suffix(".csv.tmp")
+        df.to_csv(tmp_file, index=False)
+        tmp_file.replace(filename)
+
+    return df
+
+
+def load_or_download_open_interest(
+    symbol: str = None,
+    interval_time: str = "1h",
+    days: int = 30,
+    force_download: bool = False,
+    allow_network: bool = True
+) -> pd.DataFrame:
+    """Загружает исторический Open Interest из кэша или с Bybit."""
+    symbol = symbol or SYMBOL
+    interval_map = {
+        "5": "5min", "15": "15min", "30": "30min",
+        "60": "1h", "240": "4h", "D": "1d",
+        "5min": "5min", "15min": "15min", "30min": "30min",
+        "1h": "1h", "4h": "4h", "1d": "1d",
+    }
+    iv = interval_map.get(str(interval_time), "1h")
+    data_dir = config.DATA_DIR
+    filename = data_dir / f"{symbol}_oi_{iv}_{days}d.csv"
+
+    if not force_download and os.path.exists(filename):
+        mtime = datetime.fromtimestamp(os.path.getmtime(filename))
+        age_hours = (datetime.now() - mtime).total_seconds() / 3600
+        cached = _read_nonempty_csv(filename)
+        if not cached.empty and age_hours < 6.0:
+            return cached
+
+    if allow_network:
+        df = download_open_interest_history(symbol, interval_time=iv, days=days, save_csv=True, show_progress=False)
+        if not df.empty:
+            return df
+
+    if os.path.exists(filename):
+        cached = _read_nonempty_csv(filename)
+        if not cached.empty:
+            return cached
+    return pd.DataFrame()
+
+
 # ─── CLI запуск ──────────────────────────────────────────────
 if __name__ == "__main__":
     args = sys.argv[1:]

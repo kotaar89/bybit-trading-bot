@@ -11,9 +11,11 @@ BASE_DIR         = Path(__file__).resolve().parent
 DATA_DIR         = BASE_DIR / "data"
 BOT_LOG_FILE     = BASE_DIR / "bot.log"
 TRADE_LOG_FILE   = BASE_DIR / "trade.log"
+DB_FILE          = BASE_DIR / "bot_data.db"
 STATE_FILE       = BASE_DIR / "bot_state.json"
 CONTROL_FILE     = BASE_DIR / "bot_control.json"
 LIVE_STATUS_FILE = BASE_DIR / "bot_live_status.json"
+PROFILES_FILE    = BASE_DIR / "strategy_profiles.json"
 
 # Попытка загрузить переменные из .env файла
 try:
@@ -222,3 +224,90 @@ USE_RISK_BASED_SIZING = _get_bool("USE_RISK_BASED_SIZING", True)      # Расч
 RISK_PER_TRADE_PCT    = _get_float("RISK_PER_TRADE_PCT", 0.015)       # 1.5% риска от депозита при стопе
 FALLBACK_USDT         = _get_float("FALLBACK_USDT", 50.0)
 MAX_DAILY_LOSS_PCT    = _get_float("MAX_DAILY_LOSS_PCT", 0.05)
+
+
+# =====================================================================
+# 8. ИСПОЛНЕНИЕ, WEBSOCKET KLINE, RATE LIMITS И КЭШИРОВАНИЕ (v0.3.0)
+# =====================================================================
+USE_WS_KLINE_TRIGGER        = _get_bool("USE_WS_KLINE_TRIGGER", True)
+KLINE_FALLBACK_POLL_SEC     = _get_int("KLINE_FALLBACK_POLL_SEC", 180)
+INSTRUMENT_CACHE_TTL_SEC    = _get_int("INSTRUMENT_CACHE_TTL_SEC", 86400)
+USE_MAKER_CHASE             = _get_bool("USE_MAKER_CHASE", True)
+MAX_MAKER_CHASE_ATTEMPTS    = _get_int("MAX_MAKER_CHASE_ATTEMPTS", 2)
+MAX_MAKER_CHASE_PCT         = _get_float("MAX_MAKER_CHASE_PCT", 0.004)
+MAX_MAKER_CHASE_ATR_MULT    = _get_float("MAX_MAKER_CHASE_ATR_MULT", 0.4)
+MAKER_CHASE_INTERVAL_SEC    = _get_float("MAKER_CHASE_INTERVAL_SEC", 3.0)
+MAX_ENTRY_SPREAD_PCT        = _get_float("MAX_ENTRY_SPREAD_PCT", 0.005)
+RATE_LIMIT_RESERVE_THRESHOLD = _get_int("RATE_LIMIT_RESERVE_THRESHOLD", 8)
+CLOSED_PNL_SYNC_DELAY_SEC   = _get_float("CLOSED_PNL_SYNC_DELAY_SEC", 4.0)
+
+
+# =====================================================================
+# 9. ДЕРИВАТИВНЫЙ ФИЛЬТР РЕЖИМА И REGIME SWITCHER (v0.3.0)
+# =====================================================================
+USE_FUNDING_ZSCORE_FILTER  = _get_bool("USE_FUNDING_ZSCORE_FILTER", True)
+FUNDING_ZSCORE_WINDOW      = _get_int("FUNDING_ZSCORE_WINDOW", 30)
+FUNDING_ZSCORE_LONG_MAX    = _get_float("FUNDING_ZSCORE_LONG_MAX", 2.0)
+FUNDING_ZSCORE_SHORT_MIN   = _get_float("FUNDING_ZSCORE_SHORT_MIN", -2.0)
+USE_OI_FILTER              = _get_bool("USE_OI_FILTER", True)
+OI_LOOKBACK_PERIODS        = _get_int("OI_LOOKBACK_PERIODS", 4)
+OI_DIVERGENCE_PCT          = _get_float("OI_DIVERGENCE_PCT", 0.03)
+OI_PRICE_MOVE_PCT          = _get_float("OI_PRICE_MOVE_PCT", 0.015)
+REGIME_FAST_EMA_PERIOD     = _get_int("REGIME_FAST_EMA_PERIOD", 50)
+REGIME_USE_HYBRID_TREND    = _get_bool("REGIME_USE_HYBRID_TREND", True)
+REGIME_VOL_WINDOW          = _get_int("REGIME_VOL_WINDOW", 20)
+REGIME_EXTREME_VOL_PCT     = _get_float("REGIME_EXTREME_VOL_PCT", 1.80)
+DERIVATIVES_CACHE_TTL_SEC  = _get_int("DERIVATIVES_CACHE_TTL_SEC", 900)
+
+USE_REGIME_SWITCHER        = _get_bool("USE_REGIME_SWITCHER", False)
+SWITCHER_ADX_TREND_MIN     = _get_float("SWITCHER_ADX_TREND_MIN", 22.0)
+SWITCHER_ADX_RANGE_MAX     = _get_float("SWITCHER_ADX_RANGE_MAX", 18.0)
+SWITCHER_ER_PERIOD         = _get_int("SWITCHER_ER_PERIOD", 14)
+SWITCHER_ER_TREND_MIN      = _get_float("SWITCHER_ER_TREND_MIN", 0.35)
+SWITCHER_ER_RANGE_MAX      = _get_float("SWITCHER_ER_RANGE_MAX", 0.25)
+SWITCHER_BB_PCTL_WINDOW    = _get_int("SWITCHER_BB_PCTL_WINDOW", 100)
+SWITCHER_MR_SL_MULT        = _get_float("SWITCHER_MR_SL_MULT", 1.8)
+SWITCHER_MR_TP_MULT        = _get_float("SWITCHER_MR_TP_MULT", 2.5)
+
+
+# =====================================================================
+# 10. ДИНАМИЧЕСКИЙ ОТБОР КОРЗИНЫ, ПОРТФЕЛЬНЫЙ РИСК v3 И SHADOW (v0.3.0)
+# =====================================================================
+USE_DYNAMIC_UNIVERSE         = _get_bool("USE_DYNAMIC_UNIVERSE", False)
+DYNAMIC_UNIVERSE_TOP_N       = _get_int("DYNAMIC_UNIVERSE_TOP_N", 6)
+DYNAMIC_UNIVERSE_MIN_TURNOVER = _get_float("DYNAMIC_UNIVERSE_MIN_TURNOVER", 50_000_000.0)
+DYNAMIC_UNIVERSE_MAX_SPREAD  = _get_float("DYNAMIC_UNIVERSE_MAX_SPREAD", 0.0025)
+DYNAMIC_UNIVERSE_MIN_VOL     = _get_float("DYNAMIC_UNIVERSE_MIN_VOL", 0.015)
+DYNAMIC_UNIVERSE_MAX_VOL     = _get_float("DYNAMIC_UNIVERSE_MAX_VOL", 0.18)
+UNIVERSE_REFRESH_HOURS       = _get_float("UNIVERSE_REFRESH_HOURS", 24.0)
+UNIVERSE_BLACKLIST           = [
+    s.strip().upper()
+    for s in os.getenv("UNIVERSE_BLACKLIST", "BTCUSDT,USDCUSDT,FDUSDUSDT,USDEUSDT").split(",")
+    if s.strip()
+]
+
+MAX_PORTFOLIO_HEAT_PCT   = _get_float("MAX_PORTFOLIO_HEAT_PCT", 0.035)
+USE_CORRELATION_SCALING  = _get_bool("USE_CORRELATION_SCALING", True)
+CORR_LOOKBACK_BARS       = _get_int("CORR_LOOKBACK_BARS", 336)
+CORR_THRESHOLD           = _get_float("CORR_THRESHOLD", 0.75)
+CORR_RISK_SCALE          = _get_float("CORR_RISK_SCALE", 0.6)
+
+USE_PEAK_DD_THROTTLE     = _get_bool("USE_PEAK_DD_THROTTLE", True)
+DD_THROTTLE_TIER1_PCT    = _get_float("DD_THROTTLE_TIER1_PCT", 0.06)
+DD_THROTTLE_TIER1_MULT   = _get_float("DD_THROTTLE_TIER1_MULT", 0.5)
+DD_THROTTLE_TIER2_PCT    = _get_float("DD_THROTTLE_TIER2_PCT", 0.12)
+DD_THROTTLE_RECOVER_PCT  = _get_float("DD_THROTTLE_RECOVER_PCT", 0.09)
+
+USE_LOSS_STREAK_COOLDOWN   = _get_bool("USE_LOSS_STREAK_COOLDOWN", True)
+LOSS_STREAK_SYMBOL_LIMIT   = _get_int("LOSS_STREAK_SYMBOL_LIMIT", 2)
+LOSS_STREAK_PORTFOLIO_LIMIT = _get_int("LOSS_STREAK_PORTFOLIO_LIMIT", 3)
+LOSS_STREAK_COOLDOWN_BARS  = _get_int("LOSS_STREAK_COOLDOWN_BARS", 6)
+
+USE_TIME_STOP       = _get_bool("USE_TIME_STOP", True)
+TIME_STOP_HOURS     = _get_float("TIME_STOP_HOURS", 30.0)
+TIME_STOP_HARD_HOURS = _get_float("TIME_STOP_HARD_HOURS", 36.0)
+TIME_STOP_MIN_R     = _get_float("TIME_STOP_MIN_R", 0.3)
+
+SHADOW_MODE            = _get_bool("SHADOW_MODE", False)
+SHADOW_STRATEGY        = os.getenv("SHADOW_STRATEGY", "").strip().upper()
+SHADOW_INITIAL_BALANCE = _get_float("SHADOW_INITIAL_BALANCE", 1000.0)

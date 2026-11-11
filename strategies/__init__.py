@@ -9,6 +9,7 @@ from strategies.ma_rsi_strategy import MaRsiStrategy
 from strategies.bb_rsi_reversion import BbRsiReversionStrategy
 from strategies.supertrend_atr import SupertrendAtrStrategy, SupertrendProStrategy
 from strategies.donchian_breakout import DonchianBreakoutStrategy
+from strategies.regime_switcher import RegimeSwitcherStrategy
 
 STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {
     "SUPERTREND_PRO": SupertrendProStrategy,
@@ -17,6 +18,8 @@ STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {
     "BB_RSI": BbRsiReversionStrategy,
     "SUPERTREND": SupertrendAtrStrategy,
     "DONCHIAN": DonchianBreakoutStrategy,
+    "REGIME_SWITCHER": RegimeSwitcherStrategy,
+    "ADAPTIVE": RegimeSwitcherStrategy,
 }
 
 
@@ -49,6 +52,7 @@ __all__ = [
     "SupertrendAtrStrategy",
     "SupertrendProStrategy",
     "DonchianBreakoutStrategy",
+    "RegimeSwitcherStrategy",
     "STRATEGY_REGISTRY",
     "register_strategy",
     "get_strategy",

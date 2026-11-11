@@ -20,7 +20,7 @@ class BaseStrategy(ABC):
         self.use_mtf_filter = bool(kwargs.get("use_mtf_filter", True))
         self.htf_ema_period = int(kwargs.get("htf_ema_period", 200))
 
-    def get_mtf_trend(self, htf_df: pd.DataFrame) -> str:
+    def get_mtf_trend(self, htf_df: pd.DataFrame, candle_idx: int = -2) -> str:
         """
         Определяет тренд на старшем таймфрейме: 'bullish', 'bearish' или 'neutral'.
         Доступен для всех стратегий, наследуемых от BaseStrategy.
@@ -33,8 +33,9 @@ class BaseStrategy(ABC):
             return "neutral"
 
         ema_htf = self.calc_ema(htf_df["close"], ema_period)
-        last_close = htf_df["close"].iloc[-2]  # по закрытой свече
-        last_ema = ema_htf.iloc[-2]
+        idx = candle_idx if abs(candle_idx) <= len(htf_df) else (-2 if len(htf_df) >= 2 else -1)
+        last_close = htf_df["close"].iloc[idx]  # по закрытой свече
+        last_ema = ema_htf.iloc[idx]
 
         if last_close > last_ema:
             return "bullish"

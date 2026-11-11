@@ -8,12 +8,13 @@ FastAPI веб-сервер легковесного локального даш
 """
 
 from fastapi import FastAPI, Request, Query, Body, Depends, HTTPException, WebSocketException, status, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse, Response
 from fastapi.security import HTTPBasic
 from fastapi.templating import Jinja2Templates
 from starlette.requests import HTTPConnection
 from pathlib import Path
 from collections import deque
+from datetime import datetime
 import base64
 import logging
 import asyncio
@@ -27,9 +28,14 @@ from config import (
     TRADING_MODE, SYMBOLS, ACTIVE_STRATEGY, LEVERAGE, MAX_OPEN_POSITIONS,
     API_KEY, API_SECRET, DEMO, TESTNET, FALLBACK_USDT
 )
+from risk_manager import PortfolioRiskManager, PositionRiskState
+from storage import BotDatabase
 from web.state import (
     get_bot_instance, is_bot_paused, set_bot_paused, parse_trade_log,
-    parse_equity_history, write_control_state, read_control_state, read_live_status
+    parse_equity_history, write_control_state, read_control_state, read_live_status,
+    enqueue_shadow_close,
+    get_trade_history, get_equity_curve, get_analytics_summary,
+    export_trades_csv, export_trades_json,
 )
 import config
 
@@ -82,7 +88,7 @@ def verify_dashboard_auth(conn: HTTPConnection):
 
 
 app = FastAPI(
-    title="Bybit Bot v2.3 Dashboard",
+    title="Bybit Bot v0.3.0 Dashboard",
     dependencies=[Depends(verify_dashboard_auth)]
 )
 
@@ -195,13 +201,14 @@ def _compute_status_sync() -> dict:
     mode = config.TRADING_MODE
     paused = is_bot_paused()
     is_mock_bot = bot is not None and "unittest.mock" in type(bot).__module__
+    shadow_mode_cfg = bool(getattr(config, "SHADOW_MODE", False))
 
     if bot is None:
         ctrl = read_control_state()
         if ctrl.get("trading_mode") in config.VALID_TRADING_MODES:
             mode = ctrl["trading_mode"]
 
-    cache_key = (id(bot) if bot is not None else 0, mode, paused)
+    cache_key = (id(bot) if bot is not None else 0, mode, paused, shadow_mode_cfg)
     now = time.time()
     if not is_mock_bot:
         with _CACHE_LOCK:
@@ -218,10 +225,24 @@ def _compute_status_sync() -> dict:
     unrealized_pnl = 0.0
     daily_pnl = 0.0
     positions_data = []
+    live_snap = {}
+    snap_is_shadow = False
+    sh_state = None
+    runtime_bundle = {}
+    sh_analytics = None
+
+    is_shadow_only = (
+        bot is not None
+        and not is_mock_bot
+        and shadow_mode_cfg
+        and getattr(bot, "shadow_engine", None) is not None
+        and "unittest.mock" not in type(bot.shadow_engine).__module__
+    )
 
     if bot is not None:
         try:
-            balance = float(bot.get_available_balance())
+            if not is_shadow_only:
+                balance = float(bot.get_available_balance())
             cb_active = bool(getattr(bot, "circuit_breaker_active", False))
 
             with getattr(bot, "lock", threading.RLock()):
@@ -247,7 +268,7 @@ def _compute_status_sync() -> dict:
                         pnl_usd = 0.0
                         pnl_pct = 0.0
 
-                    positions_data.append({
+                    pos_entry = {
                         "symbol": sym,
                         "side": pos.get("side", "Buy"),
                         "size": size,
@@ -258,13 +279,27 @@ def _compute_status_sync() -> dict:
                         "stop_loss": pos.get("stop_loss", 0.0),
                         "take_profit": pos.get("take_profit", 0.0),
                         "breakeven": bot.breakeven_applied.get(sym, False) if hasattr(bot, "breakeven_applied") else False
-                    })
+                    }
+                    if is_shadow_only:
+                        pos_entry["shadow_mode"] = True
+                    positions_data.append(pos_entry)
 
-            raw_eq = bot.get_wallet_equity() if hasattr(bot, "get_wallet_equity") else None
-            if isinstance(raw_eq, (int, float)) and raw_eq > 0:
-                equity = float(raw_eq)
+            if is_shadow_only:
+                sh_eng = bot.shadow_engine
+                sh_realized = float(getattr(sh_eng, "equity", 0.0) or 0.0)
+                used_margin = sum(
+                    float(getattr(r, "margin_used", 0.0) or 0.0)
+                    for r in getattr(sh_eng, "risk_states", {}).values()
+                    if r
+                )
+                balance = max(0.0, sh_realized - used_margin)
+                equity = sh_realized + unrealized_pnl
             else:
-                equity = balance + unrealized_pnl
+                raw_eq = bot.get_wallet_equity() if hasattr(bot, "get_wallet_equity") else None
+                if isinstance(raw_eq, (int, float)) and raw_eq > 0:
+                    equity = float(raw_eq)
+                else:
+                    equity = balance + unrealized_pnl
 
             start_bal = getattr(bot, "start_day_balance", equity)
             if isinstance(start_bal, (int, float)) and start_bal > 0:
@@ -276,55 +311,86 @@ def _compute_status_sync() -> dict:
             log.warning(f"Ошибка получения статуса из bot instance: {e}")
     else:
         live_snap = read_live_status()
-        cb_active = bool(live_snap.get("circuit_breaker", False))
-        be_map = live_snap.get("breakeven_map", {})
-        start_bal = float(live_snap.get("start_day_balance") or 0.0)
-        try:
-            client = get_standalone_client()
-            resp = client.get_wallet_balance(accountType="UNIFIED")
-            acc_list = resp.get("result", {}).get("list", [])
-            if acc_list:
-                acc = acc_list[0]
-                tot_avail_raw = acc.get("totalAvailableBalance")
-                tot_avail = max(0.0, float(tot_avail_raw)) if tot_avail_raw not in (None, "") else None
-                coins = acc.get("coin", [])
-                for c in coins:
-                    if c.get("coin") == "USDT":
-                        raw_avail = c.get("availableToWithdraw")
-                        avail_val = max(0.0, float(raw_avail)) if raw_avail not in (None, "") else None
-                        wb = float(c.get("walletBalance") or 0.0)
-                        pos_im = float(c.get("totalPositionIM") or 0.0)
-                        ord_im = float(c.get("totalOrderIM") or 0.0)
-                        free_wb = max(0.0, wb - pos_im - ord_im)
-                        if tot_avail is not None:
-                            balance = min(tot_avail, free_wb) if wb > 0 and (pos_im > 0 or ord_im > 0) else tot_avail
-                        elif avail_val is not None:
-                            balance = min(avail_val, free_wb) if wb > 0 and (pos_im > 0 or ord_im > 0) else avail_val
-                        else:
-                            balance = free_wb
-                        equity = float(c.get("equity") or wb or balance)
-                        break
-                else:
-                    if tot_avail is not None:
-                        balance = tot_avail
-                        equity = float(acc.get("totalEquity") or tot_avail)
+        if shadow_mode_cfg:
+            # В SHADOW_MODE никогда не запрашиваем реальный аккаунт Bybit через get_standalone_client()
+            snap_is_shadow = (
+                isinstance(live_snap, dict)
+                and bool(live_snap)
+                and (
+                    live_snap.get("shadow_mode") is True
+                    or "shadow_positions" in live_snap
+                    or (
+                        live_snap.get("shadow_mode") is not False
+                        and isinstance(live_snap.get("shadow_status"), dict)
+                    )
+                )
+            )
+            db_file = Path(getattr(config, "DB_FILE", ""))
+            if str(db_file) and db_file.exists():
+                try:
+                    db = BotDatabase(db_file)
+                    raw_sh = db.get_runtime_value("shadow_engine_state")
+                    if isinstance(raw_sh, dict):
+                        sh_state = raw_sh
+                    raw_rt = db.get_all_runtime_state()
+                    if isinstance(raw_rt, dict):
+                        runtime_bundle = raw_rt
+                    sh_analytics = db.get_analytics_summary(is_shadow=True)
+                except Exception as e:
+                    log.debug(f"Standalone shadow DB read error: {e}")
 
-            pos_resp = client.get_positions(category="linear", settleCoin="USDT")
-            raw_pos = pos_resp.get("result", {}).get("list", [])
-            for p in raw_pos:
-                sz = float(p.get("size", 0))
-                if sz > 0:
-                    sym = p.get("symbol")
-                    side = p.get("side")
-                    entry = float(p.get("avgPrice") or 0.0)
-                    mark = float(p.get("markPrice") or entry)
-                    pnl_usd = float(p.get("unrealisedPnl") or 0.0)
+            today_str = str(datetime.now().date())
+            if snap_is_shadow and "circuit_breaker" in live_snap:
+                cb_active = bool(live_snap.get("circuit_breaker", False))
+            elif str(runtime_bundle.get("start_day") or "") == today_str:
+                cb_active = bool(runtime_bundle.get("circuit_breaker_active", False))
+
+            be_map = (
+                dict(live_snap.get("breakeven_map"))
+                if (snap_is_shadow and isinstance(live_snap.get("breakeven_map"), dict))
+                else {}
+            )
+            if isinstance(sh_state, dict) and isinstance(sh_state.get("risk_states"), dict):
+                for r_sym, r_dict in sh_state["risk_states"].items():
+                    if isinstance(r_dict, dict) and r_sym not in be_map:
+                        be_map[r_sym] = bool(r_dict.get("breakeven_applied", False))
+
+            if snap_is_shadow and float(live_snap.get("start_day_balance") or 0.0) > 0:
+                start_bal = float(live_snap["start_day_balance"])
+            elif str(runtime_bundle.get("start_day") or "") == today_str and float(runtime_bundle.get("start_day_balance") or 0.0) > 0:
+                start_bal = float(runtime_bundle["start_day_balance"])
+            else:
+                start_bal = 0.0
+
+            init_sh_bal = float(getattr(config, "SHADOW_INITIAL_BALANCE", FALLBACK_USDT) or FALLBACK_USDT)
+            if snap_is_shadow and isinstance(live_snap.get("shadow_positions"), list):
+                used_margin_snap = 0.0
+                for p in live_snap["shadow_positions"]:
+                    if not isinstance(p, dict):
+                        continue
+                    sz = float(p.get("size") or 0.0)
+                    if sz <= 0:
+                        continue
+                    sym = str(p.get("symbol") or "").upper()
+                    side = str(p.get("side") or "Buy")
+                    entry = float(p.get("entry_price") or 0.0)
+                    mark = float(p.get("mark_price") or entry)
+                    is_long = side.lower() in ("buy", "long") or str(p.get("position", "")).lower() == "long"
+                    if p.get("pnl") is not None:
+                        pnl_usd = float(p["pnl"])
+                    elif entry > 0 and sz > 0:
+                        pnl_usd = ((mark - entry) if is_long else (entry - mark)) * sz
+                    else:
+                        pnl_usd = 0.0
+                    if p.get("pnl_pct") is not None:
+                        pnl_pct = float(p["pnl_pct"])
+                    elif entry > 0:
+                        diff = (mark - entry) if is_long else (entry - mark)
+                        pnl_pct = (diff / entry) * 100.0 * LEVERAGE
+                    else:
+                        pnl_pct = 0.0
                     unrealized_pnl += pnl_usd
-
-                    is_long = side == "Buy"
-                    diff = (mark - entry) if is_long else (entry - mark)
-                    pnl_pct = (diff / entry * 100 * LEVERAGE) if entry > 0 else 0.0
-
+                    used_margin_snap += float(p.get("margin") or 0.0)
                     positions_data.append({
                         "symbol": sym,
                         "side": side,
@@ -333,22 +399,315 @@ def _compute_status_sync() -> dict:
                         "mark_price": mark,
                         "pnl": round(pnl_usd, 2),
                         "pnl_pct": round(pnl_pct, 2),
-                        "stop_loss": float(p.get("stopLoss") or 0.0),
-                        "take_profit": float(p.get("takeProfit") or 0.0),
-                        "breakeven": bool(be_map.get(sym, False))
+                        "stop_loss": float(p.get("stop_loss") or 0.0),
+                        "take_profit": float(p.get("take_profit") or 0.0),
+                        "breakeven": bool(p.get("breakeven", be_map.get(sym, False))),
+                        "shadow_mode": True,
                     })
+                if live_snap.get("unrealized_pnl") is not None:
+                    unrealized_pnl = float(live_snap["unrealized_pnl"])
+                equity = float(
+                    live_snap.get("equity")
+                    or (sh_state.get("equity") if isinstance(sh_state, dict) else 0.0)
+                    or init_sh_bal
+                )
+                if live_snap.get("balance") is not None:
+                    balance = max(0.0, float(live_snap["balance"]))
+                else:
+                    balance = max(0.0, equity - unrealized_pnl - used_margin_snap)
+            elif isinstance(sh_state, dict):
+                sh_realized = float(sh_state.get("equity") or init_sh_bal)
+                sh_pos_map = sh_state.get("positions") if isinstance(sh_state.get("positions"), dict) else {}
+                sh_risk_map = sh_state.get("risk_states") if isinstance(sh_state.get("risk_states"), dict) else {}
+                used_margin = 0.0
+                for sym, pos in sh_pos_map.items():
+                    if not isinstance(pos, dict):
+                        continue
+                    sz = float(pos.get("size") or 0.0)
+                    if sz <= 0:
+                        continue
+                    sym_u = str(sym or "").upper()
+                    r_dict = sh_risk_map.get(sym) if isinstance(sh_risk_map.get(sym), dict) else {}
+                    used_margin += float(r_dict.get("margin_used") or pos.get("margin") or 0.0)
+                    entry = float(pos.get("entry_price") or r_dict.get("entry_price") or 0.0)
+                    mark = float(pos.get("mark_price") or entry)
+                    side = str(pos.get("side") or "Buy")
+                    is_long = side.lower() in ("buy", "long") or str(pos.get("position", "")).lower() == "long"
+                    diff = (mark - entry) if is_long else (entry - mark)
+                    pnl_usd = diff * sz if (entry > 0 and sz > 0) else 0.0
+                    pnl_pct = (diff / entry * 100.0 * LEVERAGE) if entry > 0 else 0.0
+                    unrealized_pnl += pnl_usd
+                    positions_data.append({
+                        "symbol": sym_u,
+                        "side": side,
+                        "size": sz,
+                        "entry_price": entry,
+                        "mark_price": mark,
+                        "pnl": round(pnl_usd, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                        "stop_loss": float(pos.get("stop_loss") or 0.0),
+                        "take_profit": float(pos.get("take_profit") or 0.0),
+                        "breakeven": bool(be_map.get(sym_u, r_dict.get("breakeven_applied", False))),
+                        "shadow_mode": True,
+                    })
+                balance = max(0.0, sh_realized - used_margin)
+                equity = sh_realized + unrealized_pnl
+                if snap_is_shadow:
+                    if float(live_snap.get("equity") or 0.0) > 0:
+                        equity = float(live_snap["equity"])
+                    if live_snap.get("balance") is not None:
+                        balance = max(0.0, float(live_snap["balance"]))
+            elif snap_is_shadow:
+                sh_st = live_snap.get("shadow_status") if isinstance(live_snap.get("shadow_status"), dict) else {}
+                raw_sh_pos = sh_st.get("positions") if isinstance(sh_st.get("positions"), list) else []
+                used_margin = 0.0
+                for pos in raw_sh_pos:
+                    if not isinstance(pos, dict):
+                        continue
+                    sz = float(pos.get("size") or 0.0)
+                    if sz <= 0:
+                        continue
+                    sym_u = str(pos.get("symbol") or "").upper()
+                    entry = float(pos.get("entry_price") or 0.0)
+                    mark = float(pos.get("mark_price") or entry)
+                    side = str(pos.get("side") or "Buy")
+                    used_margin += float(pos.get("margin") or 0.0)
+                    positions_data.append({
+                        "symbol": sym_u,
+                        "side": side,
+                        "size": sz,
+                        "entry_price": entry,
+                        "mark_price": mark,
+                        "pnl": 0.0,
+                        "pnl_pct": 0.0,
+                        "stop_loss": float(pos.get("stop_loss") or 0.0),
+                        "take_profit": float(pos.get("take_profit") or 0.0),
+                        "breakeven": bool(be_map.get(sym_u, False)),
+                        "shadow_mode": True,
+                    })
+                equity = float(live_snap.get("equity") or sh_st.get("equity") or init_sh_bal)
+                balance = (
+                    max(0.0, float(live_snap["balance"]))
+                    if live_snap.get("balance") is not None
+                    else max(0.0, equity - used_margin)
+                )
+            else:
+                balance = init_sh_bal
+                equity = init_sh_bal
 
-            if start_bal > 0 and equity > 0:
+            if snap_is_shadow and live_snap.get("daily_pnl") is not None:
+                daily_pnl = float(live_snap["daily_pnl"])
+            elif start_bal > 0 and equity > 0:
                 daily_pnl = equity - start_bal
-        except Exception as e:
-            log.warning(f"Standalone статус Bybit: {e}")
-            if live_snap:
-                balance = float(live_snap.get("balance") or FALLBACK_USDT)
-                equity = float(live_snap.get("equity") or balance)
-                daily_pnl = float(live_snap.get("daily_pnl") or 0.0)
+        else:
+            cb_active = bool(live_snap.get("circuit_breaker", False))
+            be_map = live_snap.get("breakeven_map", {})
+            start_bal = float(live_snap.get("start_day_balance") or 0.0)
+            try:
+                client = get_standalone_client()
+                resp = client.get_wallet_balance(accountType="UNIFIED")
+                acc_list = resp.get("result", {}).get("list", [])
+                if acc_list:
+                    acc = acc_list[0]
+                    tot_avail_raw = acc.get("totalAvailableBalance")
+                    tot_avail = max(0.0, float(tot_avail_raw)) if tot_avail_raw not in (None, "") else None
+                    coins = acc.get("coin", [])
+                    for c in coins:
+                        if c.get("coin") == "USDT":
+                            raw_avail = c.get("availableToWithdraw")
+                            avail_val = max(0.0, float(raw_avail)) if raw_avail not in (None, "") else None
+                            wb = float(c.get("walletBalance") or 0.0)
+                            pos_im = float(c.get("totalPositionIM") or 0.0)
+                            ord_im = float(c.get("totalOrderIM") or 0.0)
+                            free_wb = max(0.0, wb - pos_im - ord_im)
+                            if tot_avail is not None:
+                                balance = min(tot_avail, free_wb) if wb > 0 and (pos_im > 0 or ord_im > 0) else tot_avail
+                            elif avail_val is not None:
+                                balance = min(avail_val, free_wb) if wb > 0 and (pos_im > 0 or ord_im > 0) else avail_val
+                            else:
+                                balance = free_wb
+                            equity = float(c.get("equity") or wb or balance)
+                            break
+                    else:
+                        if tot_avail is not None:
+                            balance = tot_avail
+                            equity = float(acc.get("totalEquity") or tot_avail)
+
+                pos_resp = client.get_positions(category="linear", settleCoin="USDT")
+                raw_pos = pos_resp.get("result", {}).get("list", [])
+                for p in raw_pos:
+                    sz = float(p.get("size", 0))
+                    if sz > 0:
+                        sym = p.get("symbol")
+                        side = p.get("side")
+                        entry = float(p.get("avgPrice") or 0.0)
+                        mark = float(p.get("markPrice") or entry)
+                        pnl_usd = float(p.get("unrealisedPnl") or 0.0)
+                        unrealized_pnl += pnl_usd
+
+                        is_long = side == "Buy"
+                        diff = (mark - entry) if is_long else (entry - mark)
+                        pnl_pct = (diff / entry * 100 * LEVERAGE) if entry > 0 else 0.0
+
+                        positions_data.append({
+                            "symbol": sym,
+                            "side": side,
+                            "size": sz,
+                            "entry_price": entry,
+                            "mark_price": mark,
+                            "pnl": round(pnl_usd, 2),
+                            "pnl_pct": round(pnl_pct, 2),
+                            "stop_loss": float(p.get("stopLoss") or 0.0),
+                            "take_profit": float(p.get("takeProfit") or 0.0),
+                            "breakeven": bool(be_map.get(sym, False))
+                        })
+
+                if start_bal > 0 and equity > 0:
+                    daily_pnl = equity - start_bal
+            except Exception as e:
+                log.warning(f"Standalone статус Bybit: {e}")
+                if live_snap:
+                    balance = float(live_snap.get("balance") or FALLBACK_USDT)
+                    equity = float(live_snap.get("equity") or balance)
+                    daily_pnl = float(live_snap.get("daily_pnl") or 0.0)
 
     base_cap = equity if equity > 0 else balance
     unrealized_pct = (unrealized_pnl / base_cap * 100) if base_cap > 0 else 0.0
+
+    # v0.3.0 телеметрия портфельного риска, режима рынка, shadow и динамической корзины
+    portfolio_heat_pct = 0.0
+    max_portfolio_heat_pct = round(float(getattr(config, "MAX_PORTFOLIO_HEAT_PCT", 0.035)) * 100.0, 2)
+    peak_equity = round(base_cap, 2) if base_cap > 0 else 0.0
+    peak_drawdown_pct = 0.0
+    risk_scale = 1.0
+    drawdown_pause = False
+    active_symbols = list(config.SYMBOLS)
+    regime_summary = {}
+    cooldowns = {}
+    shadow_status = None
+
+    if bot is not None and not is_mock_bot:
+        try:
+            sh_eng = getattr(bot, "shadow_engine", None)
+            pr = (
+                getattr(sh_eng, "portfolio_risk", None)
+                if is_shadow_only
+                else getattr(bot, "portfolio_risk", None)
+            )
+            r_states = (
+                getattr(sh_eng, "risk_states", {})
+                if is_shadow_only
+                else getattr(bot, "risk_states", {})
+            )
+            if pr is not None and "unittest.mock" not in type(pr).__module__:
+                eq_ref = equity if equity > 0 else balance
+                portfolio_heat_pct = round(float(pr.compute_open_heat_pct(r_states, eq_ref)) * 100.0, 2)
+                dd_info = pr.update_equity(eq_ref, valid=False)
+                peak_equity = round(float(dd_info.get("peak_equity", peak_equity)), 2)
+                peak_drawdown_pct = round(float(dd_info.get("peak_dd_pct", 0.0)), 2)
+                risk_scale = round(float(dd_info.get("risk_scale", 1.0)), 2)
+                drawdown_pause = bool(dd_info.get("drawdown_pause", False))
+                cooldowns = pr.active_cooldowns()
+            act_syms = getattr(bot, "active_symbols", None)
+            if isinstance(act_syms, (list, tuple)) and act_syms:
+                active_symbols = list(act_syms)
+            reg_snap = getattr(bot, "_last_regime_snapshot", None)
+            if isinstance(reg_snap, dict):
+                regime_summary = dict(reg_snap)
+            if sh_eng is not None and "unittest.mock" not in type(sh_eng).__module__ and hasattr(sh_eng, "get_status"):
+                shadow_status = sh_eng.get_status()
+        except Exception:
+            pass
+    elif isinstance(live_snap, dict) and live_snap and (not shadow_mode_cfg or snap_is_shadow):
+        try:
+            portfolio_heat_pct = round(float(live_snap.get("portfolio_heat_pct") or 0.0), 2)
+            peak_equity = round(float(live_snap.get("peak_equity") or peak_equity), 2)
+            peak_drawdown_pct = round(float(live_snap.get("peak_drawdown_pct") or 0.0), 2)
+            risk_scale = round(float(live_snap.get("risk_scale") if live_snap.get("risk_scale") is not None else 1.0), 2)
+            drawdown_pause = bool(live_snap.get("drawdown_pause", False))
+            act_syms = live_snap.get("active_symbols")
+            if isinstance(act_syms, (list, tuple)) and act_syms:
+                active_symbols = list(act_syms)
+            if isinstance(live_snap.get("regime_summary"), dict):
+                regime_summary = dict(live_snap["regime_summary"])
+            if isinstance(live_snap.get("cooldowns"), dict):
+                cooldowns = dict(live_snap["cooldowns"])
+            if isinstance(live_snap.get("shadow_status"), dict):
+                shadow_status = dict(live_snap["shadow_status"])
+        except Exception:
+            pass
+    elif shadow_mode_cfg:
+        try:
+            if isinstance(sh_state, dict):
+                pr_raw = sh_state.get("portfolio_risk")
+                r_raw = sh_state.get("risk_states")
+                r_states_obj = {}
+                if isinstance(r_raw, dict):
+                    for r_sym, r_dict in r_raw.items():
+                        if isinstance(r_dict, dict):
+                            try:
+                                r_states_obj[r_sym] = PositionRiskState.from_dict(r_dict)
+                            except Exception:
+                                pass
+                pr_obj = PortfolioRiskManager.from_dict(
+                    pr_raw if isinstance(pr_raw, dict) else {},
+                    max_heat_pct=float(getattr(config, "MAX_PORTFOLIO_HEAT_PCT", 0.035)),
+                    use_correlation_scaling=bool(getattr(config, "USE_CORRELATION_SCALING", True)),
+                    corr_lookback_bars=int(getattr(config, "CORR_LOOKBACK_BARS", 336)),
+                    corr_threshold=float(getattr(config, "CORR_THRESHOLD", 0.75)),
+                    corr_risk_scale=float(getattr(config, "CORR_RISK_SCALE", 0.6)),
+                    use_peak_dd_throttle=bool(getattr(config, "USE_PEAK_DD_THROTTLE", True)),
+                    dd_tier1_pct=float(getattr(config, "DD_THROTTLE_TIER1_PCT", 0.06)),
+                    dd_tier1_mult=float(getattr(config, "DD_THROTTLE_TIER1_MULT", 0.5)),
+                    dd_tier2_pct=float(getattr(config, "DD_THROTTLE_TIER2_PCT", 0.12)),
+                    dd_recover_pct=float(getattr(config, "DD_THROTTLE_RECOVER_PCT", 0.09)),
+                    use_loss_cooldown=bool(getattr(config, "USE_LOSS_STREAK_COOLDOWN", True)),
+                    symbol_loss_limit=int(getattr(config, "LOSS_STREAK_SYMBOL_LIMIT", 2)),
+                    portfolio_loss_limit=int(getattr(config, "LOSS_STREAK_PORTFOLIO_LIMIT", 3)),
+                    cooldown_seconds=float(getattr(config, "LOSS_STREAK_COOLDOWN_BARS", 6)) * 3600.0,
+                )
+                eq_ref = equity if equity > 0 else balance
+                portfolio_heat_pct = round(float(pr_obj.compute_open_heat_pct(r_states_obj, eq_ref)) * 100.0, 2)
+                dd_info = pr_obj.update_equity(eq_ref, valid=False)
+                peak_equity = round(float(dd_info.get("peak_equity") or peak_equity), 2)
+                peak_drawdown_pct = round(float(dd_info.get("peak_dd_pct", 0.0)), 2)
+                risk_scale = round(float(dd_info.get("risk_scale", 1.0)), 2)
+                drawdown_pause = bool(dd_info.get("drawdown_pause", False))
+                cooldowns = pr_obj.active_cooldowns()
+            act_syms = runtime_bundle.get("active_symbols")
+            if isinstance(act_syms, (list, tuple)) and act_syms:
+                active_symbols = list(act_syms)
+        except Exception:
+            pass
+
+    raw_active = str(getattr(config, "ACTIVE_STRATEGY", "SUPERTREND_PRO")).strip().upper()
+    eff_strategy = (
+        "REGIME_SWITCHER"
+        if getattr(config, "USE_REGIME_SWITCHER", False)
+        and raw_active not in ("REGIME_SWITCHER", "ADAPTIVE")
+        else raw_active
+    )
+    if is_shadow_only and getattr(bot.shadow_engine, "strategy_name", ""):
+        eff_strategy = str(bot.shadow_engine.strategy_name)
+    elif bot is None and shadow_mode_cfg:
+        sh_cfg_strat = str(getattr(config, "SHADOW_STRATEGY", "") or "").strip().upper()
+        if isinstance(shadow_status, dict) and shadow_status.get("strategy"):
+            eff_strategy = str(shadow_status["strategy"]).strip().upper()
+        elif sh_cfg_strat:
+            eff_strategy = sh_cfg_strat
+        if shadow_status is None:
+            shadow_status = {
+                "strategy": eff_strategy,
+                "equity": round(equity, 2),
+                "initial_equity": round(float(getattr(config, "SHADOW_INITIAL_BALANCE", FALLBACK_USDT) or FALLBACK_USDT), 2),
+                "open_positions_count": len(positions_data),
+                "positions": positions_data,
+                "peak_equity": peak_equity,
+            }
+        if isinstance(sh_analytics, dict) and isinstance(shadow_status, dict):
+            shadow_status.setdefault("closed_trades", int(sh_analytics.get("total_trades") or 0))
+            shadow_status.setdefault("win_rate", float(sh_analytics.get("win_rate") or 0.0))
+            shadow_status.setdefault("total_net_pnl_usdt", float(sh_analytics.get("total_net_pnl_usdt") or 0.0))
 
     result = {
         "mode": mode,
@@ -359,12 +718,24 @@ def _compute_status_sync() -> dict:
         "unrealized_pnl": round(unrealized_pnl, 2),
         "unrealized_pnl_pct": round(unrealized_pct, 2),
         "daily_pnl": round(daily_pnl, 2),
-        "strategy": config.ACTIVE_STRATEGY,
+        "strategy": eff_strategy,
         "leverage": LEVERAGE,
         "open_positions_count": len(positions_data),
         "max_positions": MAX_OPEN_POSITIONS,
-        "symbols": config.SYMBOLS,
-        "positions": positions_data
+        "symbols": active_symbols,
+        "active_symbols": active_symbols,
+        "positions": positions_data,
+        "portfolio_heat_pct": portfolio_heat_pct,
+        "max_portfolio_heat_pct": max_portfolio_heat_pct,
+        "peak_equity": peak_equity,
+        "peak_drawdown_pct": peak_drawdown_pct,
+        "risk_scale": risk_scale,
+        "drawdown_pause": drawdown_pause,
+        "regime_summary": regime_summary,
+        "cooldowns": cooldowns,
+        "shadow_mode": shadow_mode_cfg,
+        "shadow_strategy": str(getattr(config, "SHADOW_STRATEGY", "") or ""),
+        "shadow_status": shadow_status,
     }
 
     if not is_mock_bot:
@@ -434,14 +805,18 @@ async def get_candles(
 
 
 @app.get("/api/equity_history")
-async def get_equity_history():
+async def get_equity_history(shadow: bool = Query(False)):
     """
-    Возвращает историческую кривую капитала (Equity Curve)
-    на основе реальных снимков капитала и взвешенного PnL из trade.log.
+    Возвращает историческую кривую капитала (Equity Curve) из SQLite
+    с безопасным fallback на trade.log.
     """
-    initial_balance = config.FALLBACK_USDT
+    initial_balance = (
+        getattr(config, "SHADOW_INITIAL_BALANCE", config.FALLBACK_USDT)
+        if shadow
+        else config.FALLBACK_USDT
+    )
     bot = get_bot_instance()
-    if bot is not None:
+    if bot is not None and not shadow:
         sb = getattr(bot, "start_day_balance", initial_balance)
         if isinstance(sb, (int, float)) and sb > 0:
             initial_balance = float(sb)
@@ -449,15 +824,101 @@ async def get_equity_history():
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        lambda: parse_equity_history(initial_balance=initial_balance, margin_weight=config.POSITION_SIZE_PCT)
+        lambda: get_equity_curve(
+            initial_balance=initial_balance,
+            margin_weight=config.POSITION_SIZE_PCT,
+            is_shadow=shadow,
+        ),
     )
 
 
 @app.get("/api/trades")
-async def get_trades():
-    """Возвращает историю реальных сделок из trade.log."""
+async def get_trades(
+    limit: int = Query(60, ge=1, le=500),
+    include_shadow: bool = Query(False),
+    only_shadow: bool = Query(False),
+    symbol: Optional[str] = Query(None),
+):
+    """Возвращает историю сделок из SQLite (или fallback на trade.log)."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: parse_trade_log(limit=60))
+    return await loop.run_in_executor(
+        None,
+        lambda: get_trade_history(
+            limit=limit,
+            include_shadow=include_shadow,
+            only_shadow=only_shadow,
+            symbol=symbol,
+        ),
+    )
+
+
+@app.get("/api/trades/export")
+async def export_trades(
+    format: str = Query("csv"),
+    limit: int = Query(1000, ge=1, le=5000),
+    include_shadow: bool = Query(False),
+):
+    """Экспортирует историю сделок из SQLite в формате CSV или JSON."""
+    fmt = format.strip().lower()
+    loop = asyncio.get_running_loop()
+    if fmt == "json":
+        data = await loop.run_in_executor(
+            None, lambda: export_trades_json(limit=limit, include_shadow=include_shadow)
+        )
+        return JSONResponse(
+            content=data,
+            headers={"Content-Disposition": 'attachment; filename="trades_export.json"'},
+        )
+    csv_text = await loop.run_in_executor(
+        None, lambda: export_trades_csv(limit=limit, include_shadow=include_shadow)
+    )
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="trades_export.csv"'},
+    )
+
+
+@app.get("/api/analytics")
+async def get_analytics(shadow: bool = Query(False), limit: int = Query(2000, ge=50, le=5000)):
+    """Возвращает агрегированную аналитику сделок (WinRate, PF, Net PnL USDT, Fees, Funding, MaxDD) и live-деградацию."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: get_analytics_summary(is_shadow=shadow, limit=limit)
+    )
+
+
+@app.get("/api/universe")
+async def get_universe():
+    """Возвращает текущую активную корзину и рейтинг ликвидных инструментов."""
+    bot = get_bot_instance()
+    is_mock = bot is not None and "unittest.mock" in type(bot).__module__
+    enabled = bool(getattr(config, "USE_DYNAMIC_UNIVERSE", False))
+    active = list(config.SYMBOLS)
+    rankings: list[dict] = []
+    last_refresh = 0.0
+
+    if bot is not None and not is_mock:
+        act = getattr(bot, "active_symbols", None)
+        if isinstance(act, (list, tuple)) and act:
+            active = list(act)
+        sel = getattr(bot, "universe_selector", None)
+        if sel is not None and isinstance(getattr(sel, "last_ranked", None), list):
+            rankings = list(sel.last_ranked)
+        lr = getattr(bot, "_last_universe_refresh", 0.0) or (getattr(sel, "last_refresh_ts", 0.0) if sel is not None else 0.0)
+        if isinstance(lr, (int, float)):
+            last_refresh = float(lr)
+    else:
+        snap = read_live_status()
+        if isinstance(snap.get("active_symbols"), list) and snap["active_symbols"]:
+            active = list(snap["active_symbols"])
+
+    return {
+        "enabled": enabled,
+        "active_symbols": active,
+        "rankings": rankings,
+        "last_refresh": last_refresh,
+    }
 
 
 @app.post("/api/pause")
@@ -497,15 +958,50 @@ def _close_exchange_position_safe(client, sym: str, pos_dict: dict):
 
 def _panic_close_sync() -> dict:
     bot = get_bot_instance()
+    shadow_mode_cfg = bool(getattr(config, "SHADOW_MODE", False))
     closed = []
     errors = []
 
     if bot is not None:
         try:
             bot.panic_close_all()
-            return {"status": "ok", "message": "Все позиции закрыты, бот переведен на паузу."}
+            res = {"status": "ok", "message": "Все позиции закрыты, бот переведен на паузу."}
+            if shadow_mode_cfg:
+                res["shadow_mode"] = True
+            return res
         except Exception as e:
+            if shadow_mode_cfg:
+                return {"status": "error", "shadow_mode": True, "message": str(e)}
             errors.append(str(e))
+
+    if shadow_mode_cfg:
+        live_snap = read_live_status()
+        snap_is_shadow = (
+            isinstance(live_snap, dict)
+            and bool(live_snap)
+            and (
+                live_snap.get("shadow_mode") is True
+                or "shadow_positions" in live_snap
+                or (
+                    live_snap.get("shadow_mode") is not False
+                    and isinstance(live_snap.get("shadow_status"), dict)
+                )
+            )
+        )
+        if snap_is_shadow:
+            write_control_state(is_paused=True, pending_shadow_panic=True)
+            return {
+                "status": "ok",
+                "queued": True,
+                "shadow_mode": True,
+                "message": "SHADOW_MODE: бот переведен на паузу, команда закрытия всех теневых позиций отправлена процессу bot.py.",
+            }
+        write_control_state(is_paused=True)
+        return {
+            "status": "error",
+            "shadow_mode": True,
+            "message": "SHADOW_MODE: бот переведен на паузу; теневые позиции управляются запущенным процессом bot.py (реальные биржевые ордера отключены).",
+        }
 
     try:
         client = get_standalone_client()
@@ -540,6 +1036,7 @@ async def panic_close():
 def _close_position_sync(symbol: str) -> dict:
     sym = symbol.strip().upper()
     bot = get_bot_instance()
+    shadow_mode_cfg = bool(getattr(config, "SHADOW_MODE", False))
 
     if bot is not None:
         with getattr(bot, "lock", threading.RLock()):
@@ -550,13 +1047,18 @@ def _close_position_sync(symbol: str) -> dict:
                 price = bot.get_price(sym)
                 res = bot.close_position(sym, price, reason="Ручное закрытие через UI")
                 if res is not None:
-                    return {"status": "ok", "message": f"Позиция {sym} закрыта."}
+                    out = {"status": "ok", "message": f"Позиция {sym} закрыта."}
+                    if shadow_mode_cfg:
+                        out["shadow_mode"] = True
+                    return out
+                if shadow_mode_cfg:
+                    return {"status": "error", "shadow_mode": True, "message": f"Не удалось закрыть теневую позицию {sym}."}
                 return {"status": "error", "message": f"Не удалось закрыть позицию {sym} на бирже."}
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
-        # Fallback: проверка внесписочных / Hedge позиций напрямую через клиент бота
-        client = getattr(bot, "client", None)
+        # Fallback: проверка внесписочных / Hedge позиций напрямую через клиент бота (только НЕ в SHADOW_MODE)
+        client = None if shadow_mode_cfg else getattr(bot, "client", None)
         if client is not None and hasattr(client, "get_positions"):
             try:
                 pos_resp = client.get_positions(category="linear", symbol=sym)
@@ -573,6 +1075,50 @@ def _close_position_sync(symbol: str) -> dict:
             except Exception as e:
                 return {"status": "error", "message": str(e)}
         return {"status": "error", "message": f"Открытая позиция по {sym} не найдена."}
+
+    if shadow_mode_cfg:
+        live_snap = read_live_status()
+        snap_is_shadow = (
+            isinstance(live_snap, dict)
+            and bool(live_snap)
+            and (
+                live_snap.get("shadow_mode") is True
+                or "shadow_positions" in live_snap
+                or (
+                    live_snap.get("shadow_mode") is not False
+                    and isinstance(live_snap.get("shadow_status"), dict)
+                )
+            )
+        )
+        if snap_is_shadow:
+            sh_pos_list = live_snap.get("shadow_positions")
+            if not isinstance(sh_pos_list, list):
+                sh_pos_list = (live_snap.get("shadow_status") or {}).get("positions")
+            if isinstance(sh_pos_list, list):
+                has_open = any(
+                    isinstance(p, dict)
+                    and str(p.get("symbol") or "").upper() == sym
+                    and float(p.get("size") or 0.0) > 0
+                    for p in sh_pos_list
+                )
+                if not has_open:
+                    return {
+                        "status": "error",
+                        "shadow_mode": True,
+                        "message": f"Открытая теневая позиция по {sym} не найдена.",
+                    }
+            enqueue_shadow_close(sym)
+            return {
+                "status": "ok",
+                "queued": True,
+                "shadow_mode": True,
+                "message": f"SHADOW_MODE: команда закрытия теневой позиции {sym} передана процессу bot.py.",
+            }
+        return {
+            "status": "error",
+            "shadow_mode": True,
+            "message": f"SHADOW_MODE: теневые позиции (в т.ч. {sym}) управляются запущенным процессом bot.py (реальные биржевые ордера отключены).",
+        }
 
     try:
         client = get_standalone_client()

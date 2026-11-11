@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Bybit Futures Bot v2.2 — Dashboard</title>
+    <title>Bybit Futures Bot v0.3.0 — Dashboard</title>
     <!-- Tailwind CSS (CDN) -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
@@ -34,10 +34,13 @@
             <div class="flex items-center space-x-3">
                 <div id="statusDot" class="w-3 h-3 rounded-full bg-emerald-500 pulse-dot"></div>
                 <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
-                    Bybit Bot <span class="text-xs bg-indigo-600/60 text-indigo-300 border border-indigo-500/40 px-2 py-0.5 rounded-full font-mono">v2.2</span>
+                    Bybit Bot <span class="text-xs bg-indigo-600/60 text-indigo-300 border border-indigo-500/40 px-2 py-0.5 rounded-full font-mono">v0.3.0</span>
                 </h1>
                 <span id="modeBadge" class="text-xs font-semibold px-2.5 py-1 rounded border uppercase tracking-wider bg-amber-500/20 text-amber-300 border-amber-500/40">
                     DEMO
+                </span>
+                <span id="shadowBadge" class="hidden text-[10px] font-mono px-2 py-0.5 rounded bg-violet-500/20 text-violet-300 border border-violet-500/40 uppercase">
+                    SHADOW
                 </span>
                 <span id="wsStatusBadge" class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 hidden sm:inline-block">
                     WS LIVE
@@ -85,6 +88,10 @@
                         <span>📥</span> <span>Логи Bot</span>
                     </a>
 
+                    <a id="exportCsvLink" href="/api/trades/export?format=csv" download="trades_export.csv" class="px-3 py-2 text-xs sm:text-sm font-medium rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-indigo-300 transition inline-flex items-center gap-1.5">
+                        <span>📊</span> <span>Экспорт CSV</span>
+                    </a>
+
                     <button onclick="openModeModal()" class="px-3 py-2 text-xs sm:text-sm font-medium rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 transition">
                         Сменить режим
                     </button>
@@ -112,6 +119,7 @@
                     <div class="text-xs uppercase font-medium text-slate-400">Дневной PnL</div>
                     <div id="dailyPnl" class="text-xl sm:text-2xl font-bold text-slate-300 mt-1">-- $</div>
                     <div id="circuitBreakerStatus" class="text-xs text-emerald-400 mt-0.5">Защита: Спящий</div>
+                    <div id="peakDrawdownStatus" class="text-[11px] text-slate-500 mt-0.5">Peak DD: 0.0% | x1.00</div>
                 </div>
 
                 <!-- Positions Count & Strategy -->
@@ -119,6 +127,7 @@
                     <div class="text-xs uppercase font-medium text-slate-400">Позиции / Стратегия</div>
                     <div id="activePosCount" class="text-xl sm:text-2xl font-bold text-white mt-1">0 / 3</div>
                     <div id="strategyInfo" class="text-xs text-indigo-400 mt-0.5">MA_RSI (x5)</div>
+                    <div id="heatStatus" class="text-[11px] text-slate-500 mt-0.5">Heat: 0.0% / 3.5%</div>
                 </div>
             </div>
 
@@ -195,13 +204,47 @@
                 </div>
             </div>
 
+            <!-- Analytics & Portfolio Risk Summary (v0.3.0) -->
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow space-y-3">
+                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                    <div class="flex items-center gap-2">
+                        <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">Аналитика и Риск-Режим</h2>
+                        <span id="degradationBadge" class="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">NO DATA</span>
+                    </div>
+                    <div id="regimeSummaryText" class="text-xs font-mono text-slate-400">Режим рынка: --</div>
+                </div>
+                <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 text-xs">
+                    <div class="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2.5">
+                        <div class="text-slate-400 text-[10px] uppercase">Сделки / WR</div>
+                        <div id="anTradesWr" class="font-mono font-bold text-white mt-0.5">0 (0%)</div>
+                    </div>
+                    <div class="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2.5">
+                        <div class="text-slate-400 text-[10px] uppercase">Profit Factor</div>
+                        <div id="anPf" class="font-mono font-bold text-slate-200 mt-0.5">0.00</div>
+                    </div>
+                    <div class="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2.5">
+                        <div class="text-slate-400 text-[10px] uppercase">Net PnL (USDT)</div>
+                        <div id="anNetPnl" class="font-mono font-bold text-slate-200 mt-0.5">0.00 $</div>
+                    </div>
+                    <div class="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2.5">
+                        <div class="text-slate-400 text-[10px] uppercase">Fees / Funding</div>
+                        <div id="anFees" class="font-mono font-bold text-slate-300 mt-0.5">0.00 / 0.00 $</div>
+                    </div>
+                    <div class="bg-slate-950/70 border border-slate-800/80 rounded-lg p-2.5">
+                        <div class="text-slate-400 text-[10px] uppercase">MaxDD (SQLite)</div>
+                        <div id="anMaxDd" class="font-mono font-bold text-rose-400 mt-0.5">0.0%</div>
+                    </div>
+                </div>
+                <div id="anBySymbolWrap" class="flex flex-wrap gap-2 text-[11px] font-mono"></div>
+            </div>
+
             <!-- Recent Trades Log -->
             <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow">
                 <div class="px-4 py-3 border-b border-slate-800 flex items-center justify-between">
                     <h2 class="text-sm font-bold uppercase tracking-wider text-slate-300">
-                        Последние сделки (trade.log)
+                        Последние сделки (SQLite / Логи)
                     </h2>
-                    <span class="text-xs text-slate-500">Лимит: 40</span>
+                    <span class="text-xs text-slate-500">Лимит: 60</span>
                 </div>
                 <div class="overflow-x-auto max-h-80 overflow-y-auto">
                     <table class="w-full text-left text-xs">
@@ -436,7 +479,17 @@
 
         function updateDashboardUI(data) {
             if (!data) return;
+            const prevShadowMode = latestStatusData ? Boolean(latestStatusData.shadow_mode) : null;
             latestStatusData = data;
+            const expLink = document.getElementById("exportCsvLink");
+            if (expLink) {
+                expLink.href = data.shadow_mode ? "/api/trades/export?format=csv&include_shadow=true" : "/api/trades/export?format=csv";
+            }
+            if (prevShadowMode !== Boolean(data.shadow_mode)) {
+                refreshTradesLog();
+                refreshAnalytics();
+                if (typeof equitySeries !== "undefined" && equitySeries) loadEquityChart();
+            }
 
             // 1. Mode Badge
             const modeBadge = document.getElementById("modeBadge");
@@ -498,10 +551,54 @@
             cbStatus.innerText = "Защита: " + (data.circuit_breaker ? "АКТИВНА (Стоп)" : "Спящий");
             cbStatus.className = "text-xs mt-0.5 " + (data.circuit_breaker ? "text-rose-400 font-bold" : "text-emerald-400");
 
+            const peakEl = document.getElementById("peakDrawdownStatus");
+            if (peakEl) {
+                const pdd = Number(data.peak_drawdown_pct || 0);
+                const rScale = Number(data.risk_scale ?? 1.0);
+                const ddPause = Boolean(data.drawdown_pause);
+                peakEl.textContent = `Peak DD: ${pdd.toFixed(1)}% | x${rScale.toFixed(2)}${ddPause ? " (DD PAUSE)" : ""}`;
+                peakEl.className = "text-[11px] mt-0.5 " + (ddPause ? "text-rose-400 font-semibold" : (rScale < 1.0 ? "text-amber-400" : "text-slate-500"));
+            }
+
             // 6. Positions Count & Dynamic Symbols List
             document.getElementById("activePosCount").innerText = `${data.open_positions_count} / ${data.max_positions}`;
             document.getElementById("posCountBadge").innerText = data.open_positions_count;
             document.getElementById("strategyInfo").innerText = `${data.strategy} (x${data.leverage})`;
+
+            const heatEl = document.getElementById("heatStatus");
+            if (heatEl) {
+                const hPct = Number(data.portfolio_heat_pct || 0);
+                const hMax = Number(data.max_portfolio_heat_pct || 3.5);
+                heatEl.textContent = `Heat: ${hPct.toFixed(2)}% / ${hMax.toFixed(1)}%`;
+                heatEl.className = "text-[11px] mt-0.5 " + (hPct >= hMax * 0.9 ? "text-amber-400" : "text-slate-500");
+            }
+
+            const shBadge = document.getElementById("shadowBadge");
+            if (shBadge) {
+                if (data.shadow_mode || data.shadow_strategy) {
+                    shBadge.classList.remove("hidden");
+                    const shEq = data.shadow_status ? ` $${Number(data.shadow_status.equity || 0).toFixed(0)}` : "";
+                    shBadge.textContent = (data.shadow_mode ? "SHADOW MODE" : `A/B ${data.shadow_strategy}`) + shEq;
+                } else {
+                    shBadge.classList.add("hidden");
+                }
+            }
+
+            const regEl = document.getElementById("regimeSummaryText");
+            if (regEl) {
+                const rs = data.regime_summary || {};
+                const parts = [];
+                if (rs.btc_close) parts.push(`BTC ${Number(rs.btc_close).toFixed(0)}`);
+                if (rs.trend && rs.trend !== "unknown") parts.push(String(rs.trend).toUpperCase());
+                if (rs.rsi !== undefined && rs.rsi !== null) parts.push(`RSI ${Number(rs.rsi).toFixed(0)}`);
+                if (rs.realized_vol !== undefined && rs.realized_vol !== null) parts.push(`Vol ${Number(rs.realized_vol).toFixed(0)}%`);
+                if (rs.funding_zscore !== undefined && rs.funding_zscore !== null) parts.push(`FZ ${Number(rs.funding_zscore).toFixed(2)}`);
+                if (rs.oi_change_pct !== undefined && rs.oi_change_pct !== null) parts.push(`OI ${Number(rs.oi_change_pct).toFixed(1)}%`);
+                if (rs.long_allowed !== undefined && rs.long_allowed !== null) parts.push(rs.long_allowed ? "L:OK" : "L:BLK");
+                if (rs.short_allowed !== undefined && rs.short_allowed !== null) parts.push(rs.short_allowed ? "S:OK" : "S:BLK");
+                if (data.shadow_status && !data.shadow_mode) parts.push(`Shadow Eq: ${Number(data.shadow_status.equity || 0).toFixed(2)}$`);
+                regEl.textContent = parts.length > 0 ? parts.join(" | ") : "Режим рынка: --";
+            }
 
             if (Array.isArray(data.symbols) && data.symbols.length > 0) {
                 const chartSel = document.getElementById("chartSymbolSelect");
@@ -661,7 +758,8 @@
 
         async function refreshTradesLog() {
             try {
-                const res = await fetch("/api/trades");
+                const url = latestStatusData?.shadow_mode ? "/api/trades?only_shadow=true" : "/api/trades";
+                const res = await fetch(url);
                 if (!res.ok) return;
                 const trades = await res.json();
                 const tbody = document.getElementById("tradesTableBody");
@@ -894,7 +992,8 @@
         async function loadEquityChart() {
             if (!equitySeries) return;
             try {
-                const res = await fetch("/api/equity_history");
+                const url = latestStatusData?.shadow_mode ? "/api/equity_history?shadow=true" : "/api/equity_history";
+                const res = await fetch(url);
                 if (res.ok) {
                     const data = await res.json();
                     if (data && data.length > 0) {
@@ -978,15 +1077,72 @@
             }
         }
 
+        async function refreshAnalytics() {
+            try {
+                const url = latestStatusData?.shadow_mode ? "/api/analytics?shadow=true" : "/api/analytics";
+                const res = await fetch(url);
+                if (!res.ok) return;
+                const an = await res.json();
+                const trEl = document.getElementById("anTradesWr");
+                const pfEl = document.getElementById("anPf");
+                const pnlEl = document.getElementById("anNetPnl");
+                const feesEl = document.getElementById("anFees");
+                const ddEl = document.getElementById("anMaxDd");
+                const degEl = document.getElementById("degradationBadge");
+                const symWrap = document.getElementById("anBySymbolWrap");
+
+                if (trEl) trEl.textContent = `${an.total_trades || 0} (${Number(an.win_rate || 0).toFixed(1)}%)`;
+                if (pfEl) pfEl.textContent = Number(an.profit_factor || 0).toFixed(2);
+                if (pnlEl) {
+                    const np = Number(an.total_net_pnl_usdt || 0);
+                    pnlEl.textContent = `${np >= 0 ? "+" : ""}${np.toFixed(2)} $`;
+                    pnlEl.className = "font-mono font-bold mt-0.5 " + (np >= 0 ? "text-emerald-400" : "text-rose-400");
+                }
+                if (feesEl) {
+                    feesEl.textContent = `${Number(an.total_fees_usdt || 0).toFixed(2)} / ${Number(an.total_funding_usdt || 0).toFixed(2)} $`;
+                }
+                if (ddEl) ddEl.textContent = `${Number(an.max_drawdown_pct || 0).toFixed(1)}%`;
+
+                if (degEl && an.degradation) {
+                    const st = String(an.degradation.status || "INSUFFICIENT_DATA");
+                    degEl.textContent = st;
+                    if (st === "OK") {
+                        degEl.className = "text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
+                    } else if (st === "WARNING" || st === "DEGRADED") {
+                        degEl.className = "text-[10px] font-mono px-2 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/30";
+                    } else {
+                        degEl.className = "text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700";
+                    }
+                }
+
+                if (symWrap) {
+                    symWrap.replaceChildren();
+                    const bySym = an.by_symbol || {};
+                    for (const [sym, info] of Object.entries(bySym)) {
+                        const chip = document.createElement("span");
+                        const u = Number(info.net_pnl_usdt || 0);
+                        const ok = u >= 0;
+                        chip.className = `px-2 py-0.5 rounded border ${ok ? "bg-emerald-950/40 border-emerald-800/50 text-emerald-300" : "bg-rose-950/40 border-rose-800/50 text-rose-300"}`;
+                        chip.textContent = `${sym}: ${u >= 0 ? "+" : ""}${u.toFixed(2)}$ (${info.trades || 0} / WR ${Number(info.win_rate || 0).toFixed(0)}%)`;
+                        symWrap.appendChild(chip);
+                    }
+                }
+            } catch (err) {
+                console.warn("Analytics refresh error:", err);
+            }
+        }
+
         // ======================= INITIALIZATION =======================
 
         refreshData();
         refreshTradesLog();
+        refreshAnalytics();
         initWebSocket();
         setTimeout(initCharts, 300);
 
-        // Fallback polling for logs and backup status check
+        // Fallback polling for logs, analytics and backup status check
         setInterval(refreshTradesLog, 8000);
+        setInterval(refreshAnalytics, 12000);
         setInterval(() => {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 refreshData();
