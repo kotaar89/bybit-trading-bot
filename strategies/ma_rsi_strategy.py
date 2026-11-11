@@ -62,6 +62,7 @@ class MaRsiStrategy(BaseStrategy):
 
         if len(df) < self.slow_ma + 5:
             df["signal"] = 0
+            df["exit_signal"] = 0
             df["ATR"] = 0.0
             return df
 
@@ -73,6 +74,7 @@ class MaRsiStrategy(BaseStrategy):
         df["ADX"] = self.calc_adx(df, self.adx_period)
 
         df["signal"] = 0
+        df["exit_signal"] = 0
 
         # Условия пересечений
         golden_cross = (
@@ -83,6 +85,10 @@ class MaRsiStrategy(BaseStrategy):
             (df["MA_fast"] < df["MA_slow"]) &
             (df["MA_fast"].shift(1) >= df["MA_slow"].shift(1))
         )
+
+        # Сигналы выхода (разворота встречной позиции) не блокируются фильтрами входа
+        df.loc[golden_cross, "exit_signal"] = 1
+        df.loc[death_cross, "exit_signal"] = -1
 
         # Окно подтверждения сигнала (пересечение в пределах последних N свечей)
         if self.cross_lookback > 1:
@@ -106,10 +112,12 @@ class MaRsiStrategy(BaseStrategy):
         else:
             adx_ok = pd.Series(True, index=df.index)
 
-        # Старший таймфрейм, если колонка HTF_EMA уже объединена с df
+        # Старший таймфрейм, если колонка HTF_EMA уже объединена с df (корректно обрабатываем NaN и HTF_CLOSE)
         if self.use_mtf_filter and "HTF_EMA" in df.columns:
-            mtf_long = df["close"] > df["HTF_EMA"]
-            mtf_short = df["close"] < df["HTF_EMA"]
+            htf_ref = df["HTF_CLOSE"] if "HTF_CLOSE" in df.columns else df["close"]
+            valid_htf = df["HTF_EMA"].notna() & htf_ref.notna()
+            mtf_long = valid_htf & (htf_ref > df["HTF_EMA"])
+            mtf_short = valid_htf & (htf_ref < df["HTF_EMA"])
         else:
             mtf_long = pd.Series(True, index=df.index)
             mtf_short = pd.Series(True, index=df.index)
@@ -117,10 +125,10 @@ class MaRsiStrategy(BaseStrategy):
         long_cond = recent_golden & rsi_long & vol_ok & mtf_long & adx_ok
         short_cond = recent_death & rsi_short & vol_ok & mtf_short & adx_ok
 
-        # Защита от дублирования сигнала на соседних свечах одного и того же окна пересечения
+        # Однократный вход на одно пересечение (даже при пропуске бара в середине окна cross_lookback)
         if self.cross_lookback > 1:
-            long_cond = long_cond & (~long_cond.shift(1, fill_value=False))
-            short_cond = short_cond & (~short_cond.shift(1, fill_value=False))
+            long_cond = long_cond & (long_cond.groupby(golden_cross.cumsum()).cumsum() == 1)
+            short_cond = short_cond & (short_cond.groupby(death_cross.cumsum()).cumsum() == 1)
 
         df.loc[long_cond, "signal"] = 1
         df.loc[short_cond, "signal"] = -1

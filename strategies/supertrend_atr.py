@@ -41,6 +41,7 @@ class SupertrendAtrStrategy(BaseStrategy):
         df = df.copy()
         if len(df) < max(self.st_period, self.vol_sma_period) + 5:
             df["signal"] = 0
+            df["exit_signal"] = 0
             df["ATR"] = 0.0
             return df
 
@@ -51,10 +52,15 @@ class SupertrendAtrStrategy(BaseStrategy):
         df["VOL_SMA"] = self.calc_sma(df["volume"], self.vol_sma_period)
 
         df["signal"] = 0
+        df["exit_signal"] = 0
 
         # Сигналы при смене направления SuperTrend
         long_flip = (df["Trend"] == 1) & (df["Trend"].shift(1) == -1)
         short_flip = (df["Trend"] == -1) & (df["Trend"].shift(1) == 1)
+
+        # Выход/разворот встречной позиции не должен блокироваться фильтрами входа
+        df.loc[long_flip, "exit_signal"] = 1
+        df.loc[short_flip, "exit_signal"] = -1
 
         if self.volume_filter:
             vol_ok = df["volume"] >= (df["VOL_SMA"] * self.vol_threshold_mult)
@@ -110,6 +116,8 @@ class SupertrendProStrategy(SupertrendAtrStrategy):
         rsi_period: int = 14,
         rsi_long_max: float = 72.0,
         rsi_short_min: float = 28.0,
+        confirm_lookback: int = 1,
+        use_confirm_ema: bool = True,
         **kwargs
     ):
         super().__init__(
@@ -131,25 +139,71 @@ class SupertrendProStrategy(SupertrendAtrStrategy):
         self.rsi_period = rsi_period
         self.rsi_long_max = rsi_long_max
         self.rsi_short_min = rsi_short_min
+        self.confirm_lookback = max(1, int(confirm_lookback))
+        self.use_confirm_ema = bool(use_confirm_ema)
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = super().calculate_indicators(df)
-        if len(df) < max(self.confirm_ema_period, self.st_period, self.vol_sma_period) + 5:
+        df = df.copy()
+        min_req = max(self.confirm_ema_period, self.st_period, self.vol_sma_period) + 5
+        if len(df) < min_req:
+            df["signal"] = 0
+            df["exit_signal"] = 0
+            df["ATR"] = 0.0
             return df
 
+        supertrend, trend = self.calc_supertrend(df, period=self.st_period, multiplier=self.st_multiplier)
+        df["SuperTrend"] = supertrend
+        df["Trend"] = trend
+        df["ATR"] = self.calc_atr(df, self.atr_period)
+        df["VOL_SMA"] = self.calc_sma(df["volume"], self.vol_sma_period)
         df["ADX"] = self.calc_adx(df, self.adx_period)
         df["RSI"] = self.calc_rsi(df["close"], self.rsi_period)
         df["EMA50"] = self.calc_ema(df["close"], self.confirm_ema_period)
+
+        df["signal"] = 0
+        df["exit_signal"] = 0
+
+        long_flip = (df["Trend"] == 1) & (df["Trend"].shift(1) == -1)
+        short_flip = (df["Trend"] == -1) & (df["Trend"].shift(1) == 1)
+
+        # Сигналы выхода (разворота встречной позиции) не блокируются фильтрами входа
+        df.loc[long_flip, "exit_signal"] = 1
+        df.loc[short_flip, "exit_signal"] = -1
+
+        if self.confirm_lookback > 1:
+            recent_long = long_flip.rolling(window=self.confirm_lookback, min_periods=1).max().astype(bool) & (df["Trend"] == 1)
+            recent_short = short_flip.rolling(window=self.confirm_lookback, min_periods=1).max().astype(bool) & (df["Trend"] == -1)
+        else:
+            recent_long = long_flip
+            recent_short = short_flip
+
+        if self.volume_filter:
+            vol_ok = df["volume"] >= (df["VOL_SMA"] * self.vol_threshold_mult)
+        else:
+            vol_ok = pd.Series(True, index=df.index)
 
         if self.use_adx_filter:
             adx_ok = df["ADX"] >= self.adx_threshold
         else:
             adx_ok = pd.Series(True, index=df.index)
 
-        long_ok = adx_ok & (df["close"] >= df["EMA50"]) & (df["RSI"] <= self.rsi_long_max)
-        short_ok = adx_ok & (df["close"] <= df["EMA50"]) & (df["RSI"] >= self.rsi_short_min)
+        if self.use_confirm_ema and self.confirm_ema_period > 0:
+            ema_long_ok = df["close"] >= df["EMA50"]
+            ema_short_ok = df["close"] <= df["EMA50"]
+        else:
+            ema_long_ok = pd.Series(True, index=df.index)
+            ema_short_ok = pd.Series(True, index=df.index)
 
-        df.loc[(df["signal"] == 1) & (~long_ok), "signal"] = 0
-        df.loc[(df["signal"] == -1) & (~short_ok), "signal"] = 0
-        return df
+        long_cond = recent_long & vol_ok & adx_ok & ema_long_ok & (df["RSI"] <= self.rsi_long_max)
+        short_cond = recent_short & vol_ok & adx_ok & ema_short_ok & (df["RSI"] >= self.rsi_short_min)
+
+        if self.confirm_lookback > 1:
+            long_ids = long_flip.cumsum()
+            short_ids = short_flip.cumsum()
+            long_cond = long_cond & (long_cond.groupby(long_ids).cumsum() == 1)
+            short_cond = short_cond & (short_cond.groupby(short_ids).cumsum() == 1)
+
+        df.loc[long_cond, "signal"] = 1
+        df.loc[short_cond, "signal"] = -1
+        return self.apply_mtf_filter_to_df(df)
 

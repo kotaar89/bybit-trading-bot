@@ -26,15 +26,18 @@ class PositionRiskState:
     atr_value: float = 0.0
     risk_r: float = 0.0                # |entry_price - initial_sl|
     r_mult: float = 1.5                # Множитель R для TP1
-    tp1_price: float = 0.0             # Цель TP1 (1.5R)
+    tp1_price: float = 0.0             # Цель TP1 (r_mult * R)
     tp1_executed: bool = False         # Выполнена ли частичная фиксация
     tp1_order_id: str = ""             # ID биржевого лимитного ордера TP1
+    tp1_fill_price: float = 0.0        # Фактическая цена исполнения TP1
+    tp1_closed_qty: float = 0.0        # Фактически закрытый объем по TP1
     breakeven_applied: bool = False    # Перенесен ли стоп в безубыток
     trailing_active: bool = False      # Активирован ли трейлинг-стоп
     native_trailing_active: bool = False # Активирован ли нативный трейлинг на бирже
     highest_price: float = 0.0         # Максимум цены с момента входа (для лонга)
     lowest_price: float = float("inf") # Минимум цены с момента входа (для шорта)
     position_idx: int = 0              # 0: One-Way, 1: Hedge Buy, 2: Hedge Sell
+    opened_at: float = 0.0             # Unix timestamp открытия позиции
 
     def __post_init__(self):
         if self.highest_price <= 0:
@@ -118,11 +121,14 @@ class PositionRiskState:
             "tp1_price": self.tp1_price,
             "tp1_executed": self.tp1_executed,
             "tp1_order_id": self.tp1_order_id,
+            "tp1_fill_price": self.tp1_fill_price,
+            "tp1_closed_qty": self.tp1_closed_qty,
             "breakeven_applied": self.breakeven_applied,
             "trailing_active": self.trailing_active,
             "native_trailing_active": self.native_trailing_active,
             "highest_price": self.highest_price,
             "position_idx": self.position_idx,
+            "opened_at": self.opened_at,
             "lowest_price": self.lowest_price if self.lowest_price != float("inf") else self.entry_price,
         }
 
@@ -143,17 +149,20 @@ class PositionRiskState:
             tp1_price=float(data.get("tp1_price", 0.0)),
             tp1_executed=bool(data.get("tp1_executed", False)),
             tp1_order_id=str(data.get("tp1_order_id", "")),
+            tp1_fill_price=float(data.get("tp1_fill_price", 0.0)),
+            tp1_closed_qty=float(data.get("tp1_closed_qty", 0.0)),
             breakeven_applied=bool(data.get("breakeven_applied", False)),
             trailing_active=bool(data.get("trailing_active", False)),
             native_trailing_active=bool(data.get("native_trailing_active", False)),
             highest_price=float(data.get("highest_price", 0.0)),
             position_idx=int(data.get("position_idx", 0)),
+            opened_at=float(data.get("opened_at", 0.0)),
             lowest_price=float(data.get("lowest_price", float("inf"))),
         )
 
     def check_partial_tp(self, current_price: float, ratio: float = 0.5, offset_pct: float = 0.002) -> tuple[bool, float, float]:
         """
-        Проверяет достижение TP1 = 1.5R.
+        Проверяет достижение TP1 = r_mult * R.
         Возвращает (сработал_ли, объем_к_закрытию, новый_уровень_SL_б/у).
         """
         if self.tp1_executed or self.tp1_price <= 0:
@@ -313,16 +322,17 @@ class MarketRegimeFilter:
         :return: (разрешен_ли, причина_запрета_или_статус)
         """
         if btc_df is None or btc_df.empty or len(btc_df) < max(self.ema_period, 30):
-            return True, "Нет достаточных данных BTC для фильтра сентимента"
+            return False, f"Нет достаточных данных {self.benchmark_symbol} для фильтра сентимента (fail-safe)"
 
         df = btc_df
         close = df["close"]
 
         # 1. Проверка на Market Dump
         if "BENCH_DUMP" in df.columns:
-            is_dump = bool(df["BENCH_DUMP"].iloc[-1])
+            raw_dump = df["BENCH_DUMP"].iloc[-1]
+            is_dump = True if pd.isna(raw_dump) else bool(raw_dump)
         else:
-            lookback = min(self.dump_lookback_candles, len(df) - 1)
+            lookback = max(1, min(self.dump_lookback_candles, len(df)))
             recent_high = df["high"].iloc[-lookback:].max()
             last_close = close.iloc[-1]
             dump_drop = (recent_high - last_close) / recent_high if recent_high > 0 else 0.0
@@ -347,6 +357,9 @@ class MarketRegimeFilter:
         else:
             last_ema = float(close.ewm(span=self.ema_period, adjust=False).mean().iloc[idx])
 
+        if np.isnan(last_close) or np.isnan(last_ema):
+            return False, f"Фильтр сентимента: NaN в данных {self.benchmark_symbol} (fail-safe)"
+
         if last_close < last_ema:
             msg = (
                 f"Фильтр сентимента: {self.benchmark_symbol} ({last_close:.1f}) ниже EMA "
@@ -363,13 +376,15 @@ class MarketRegimeFilter:
             loss = -delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
             last_gain = float(gain.iloc[idx])
             last_loss = float(loss.iloc[idx])
+            if np.isnan(last_gain) or np.isnan(last_loss):
+                return False, f"Фильтр сентимента: NaN RSI {self.benchmark_symbol} (fail-safe)"
             if last_loss == 0.0:
                 last_rsi = 100.0 if last_gain > 0 else 50.0
             else:
                 rs = last_gain / last_loss
                 last_rsi = float(100 - (100 / (1 + rs)))
 
-        if last_rsi < self.rsi_threshold:
+        if np.isnan(last_rsi) or last_rsi < self.rsi_threshold:
             msg = (
                 f"Фильтр сентимента: RSI {self.benchmark_symbol} ({last_rsi:.1f}) ниже порога "
                 f"{self.rsi_threshold:.1f}. Лонг по {symbol} отклонен."
@@ -384,16 +399,17 @@ class MarketRegimeFilter:
         Блокирует шорты при сильном бычьем тренде или резком пампе BTC.
         """
         if btc_df is None or btc_df.empty or len(btc_df) < max(self.ema_period, 30):
-            return True, "Нет достаточных данных BTC для фильтра сентимента"
+            return False, f"Нет достаточных данных {self.benchmark_symbol} для фильтра сентимента (fail-safe)"
 
         df = btc_df
         close = df["close"]
 
         # 1. Проверка на Market Pump
         if "BENCH_PUMP" in df.columns:
-            is_pump = bool(df["BENCH_PUMP"].iloc[-1])
+            raw_pump = df["BENCH_PUMP"].iloc[-1]
+            is_pump = True if pd.isna(raw_pump) else bool(raw_pump)
         else:
-            lookback = min(self.dump_lookback_candles, len(df) - 1)
+            lookback = max(1, min(self.dump_lookback_candles, len(df)))
             recent_low = df["low"].iloc[-lookback:].min()
             last_close = close.iloc[-1]
             pump_gain = (last_close - recent_low) / recent_low if recent_low > 0 else 0.0
@@ -417,6 +433,9 @@ class MarketRegimeFilter:
         else:
             last_ema = float(close.ewm(span=self.ema_period, adjust=False).mean().iloc[idx])
 
+        if np.isnan(last_close) or np.isnan(last_ema):
+            return False, f"Фильтр сентимента: NaN в данных {self.benchmark_symbol} (fail-safe)"
+
         # 3. Проверка RSI бенчмарка (по последней закрытой свече idx=-2)
         if "BENCH_RSI" in df.columns:
             last_rsi = float(df["BENCH_RSI"].iloc[idx])
@@ -426,13 +445,15 @@ class MarketRegimeFilter:
             loss = -delta.clip(upper=0).ewm(alpha=1/14, adjust=False).mean()
             last_gain = float(gain.iloc[idx])
             last_loss = float(loss.iloc[idx])
+            if np.isnan(last_gain) or np.isnan(last_loss):
+                return False, f"Фильтр сентимента: NaN RSI {self.benchmark_symbol} (fail-safe)"
             if last_loss == 0.0:
                 last_rsi = 100.0 if last_gain > 0 else 50.0
             else:
                 rs = last_gain / last_loss
                 last_rsi = float(100 - (100 / (1 + rs)))
 
-        if last_close > last_ema and last_rsi > self.bull_rsi_threshold:
+        if np.isnan(last_rsi) or (last_close > last_ema and last_rsi > self.bull_rsi_threshold):
             msg = (
                 f"Фильтр сентимента: {self.benchmark_symbol} в сильном бычьем тренде "
                 f"(выше EMA и RSI {last_rsi:.1f} > {self.bull_rsi_threshold:.1f}). Шорт по {symbol} отклонен."

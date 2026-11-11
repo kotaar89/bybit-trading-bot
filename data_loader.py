@@ -11,6 +11,7 @@ import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from pybit.unified_trading import HTTP
+import config
 from config import API_KEY, API_SECRET, TESTNET, SYMBOL, INTERVAL
 try:
     from config import DEMO
@@ -138,18 +139,26 @@ def download_klines(
     for col in ["open", "high", "low", "close", "volume", "turnover"]:
         df[col] = df[col].astype(float)
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms")
     df = df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
 
     # Отрезаем ровно нужный период
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     df = df[df["timestamp"] >= pd.Timestamp(cutoff)].reset_index(drop=True)
 
+    if df.empty:
+        if show_progress:
+            print(f"После фильтрации за {days} дн. для {symbol} ({interval}m) свечей не осталось. Кэш не перезаписан.")
+        return pd.DataFrame()
+
     # ─── Сохраняем CSV ───────────────────────────────────────
     if save_csv:
-        os.makedirs("data", exist_ok=True)
-        filename = f"data/{symbol}_{interval}m_{days}d.csv"
-        df.to_csv(filename, index=False)
+        data_dir = config.DATA_DIR
+        os.makedirs(data_dir, exist_ok=True)
+        filename = data_dir / f"{symbol}_{interval}m_{days}d.csv"
+        tmp_file = filename.with_suffix(".csv.tmp")
+        df.to_csv(tmp_file, index=False)
+        tmp_file.replace(filename)
         if show_progress:
             size_kb = os.path.getsize(filename) / 1024
             print(f"Сохранено: {filename} ({size_kb:.1f} KB)")
@@ -161,6 +170,19 @@ def download_klines(
         print()
 
     return df
+
+
+def _read_nonempty_csv(filename) -> pd.DataFrame:
+    """Читает CSV и возвращает пустой DataFrame, если файл пуст или поврежден."""
+    try:
+        if not os.path.exists(filename) or os.path.getsize(filename) == 0:
+            return pd.DataFrame()
+        df = pd.read_csv(filename, parse_dates=["timestamp"])
+        if df.empty or "timestamp" not in df.columns:
+            return pd.DataFrame()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def load_or_download(
@@ -178,7 +200,8 @@ def load_or_download(
     symbol   = symbol   or SYMBOL
     interval = interval or INTERVAL
 
-    filename = f"data/{symbol}_{interval}m_{days}d.csv"
+    data_dir = config.DATA_DIR
+    filename = data_dir / f"{symbol}_{interval}m_{days}d.csv"
 
     if not force_download and os.path.exists(filename):
         # Проверяем свежесть файла
@@ -188,18 +211,130 @@ def load_or_download(
         max_age_hours = max(1, tf_minutes / 60 * 2)  # 2 свечи устарело — перекачать
 
         if age_hours < max_age_hours:
-            print(f"Загружаем из кэша: {filename} (обновлен {age_hours:.1f}ч назад)")
-            df = pd.read_csv(filename, parse_dates=["timestamp"])
-            print(f"Загружено {len(df)} свечей из кэша\n")
-            return df
+            cached = _read_nonempty_csv(filename)
+            if not cached.empty:
+                print(f"Загружаем из кэша: {filename} (обновлен {age_hours:.1f}ч назад)")
+                print(f"Загружено {len(cached)} свечей из кэша\n")
+                return cached
+            else:
+                print(f"Кэш {filename} пуст/поврежден, скачиваем заново...\n")
         else:
             print(f"Кэш устарел ({age_hours:.1f}ч), скачиваем заново...\n")
 
     df = download_klines(symbol, interval, days)
     if df.empty and os.path.exists(filename):
-        print(f"Внимание: Не удалось обновить данные с биржи. Используем имеющийся кэш: {filename}")
-        return pd.read_csv(filename, parse_dates=["timestamp"])
+        cached = _read_nonempty_csv(filename)
+        if not cached.empty:
+            print(f"Внимание: Не удалось обновить данные с биржи. Используем имеющийся кэш: {filename}")
+            return cached
     return df
+
+
+def download_funding_history(
+    symbol: str = None,
+    days: int = 90,
+    save_csv: bool = True,
+    show_progress: bool = False
+) -> pd.DataFrame:
+    """
+    Скачивает исторический 8-часовой Funding Rate с Bybit (публичный endpoint).
+    """
+    symbol = symbol or SYMBOL
+    client = HTTP(
+        testnet=TESTNET,
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        demo=DEMO,
+        timeout=10,
+        max_retries=2,
+    )
+
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    all_rows = []
+    end_time = None
+    consecutive_errors = 0
+
+    for _ in range(20):
+        params = dict(category="linear", symbol=symbol, limit=200)
+        if end_time is not None:
+            params["endTime"] = end_time
+        try:
+            resp = client.get_funding_rate_history(**params)
+            if resp.get("retCode", 0) != 0:
+                raise RuntimeError(f"Bybit retCode={resp.get('retCode')}: {resp.get('retMsg')}")
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            if show_progress:
+                print(f"Ошибка загрузки funding {symbol}: {e}")
+            if consecutive_errors >= 2:
+                break
+            time.sleep(0.5)
+            continue
+
+        batch = resp.get("result", {}).get("list", [])
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        oldest_ts = min(int(item["fundingRateTimestamp"]) for item in batch)
+        if oldest_ts <= cutoff_ms or len(batch) < 200:
+            break
+        end_time = oldest_ts - 1
+        time.sleep(0.1)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    df["timestamp"] = pd.to_datetime(df["fundingRateTimestamp"].astype("int64"), unit="ms")
+    df["fundingRate"] = df["fundingRate"].astype(float)
+    df = df[["timestamp", "fundingRate"]].drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
+    cutoff_dt = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    df = df[df["timestamp"] >= pd.Timestamp(cutoff_dt)].reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame()
+
+    if save_csv:
+        data_dir = config.DATA_DIR
+        os.makedirs(data_dir, exist_ok=True)
+        filename = data_dir / f"{symbol}_funding_{days}d.csv"
+        tmp_file = filename.with_suffix(".csv.tmp")
+        df.to_csv(tmp_file, index=False)
+        tmp_file.replace(filename)
+
+    return df
+
+
+def load_or_download_funding(
+    symbol: str = None,
+    days: int = 90,
+    force_download: bool = False,
+    allow_network: bool = True
+) -> pd.DataFrame:
+    """Загружает исторический Funding Rate из кэша или с Bybit."""
+    symbol = symbol or SYMBOL
+    data_dir = config.DATA_DIR
+    filename = data_dir / f"{symbol}_funding_{days}d.csv"
+
+    if not force_download and os.path.exists(filename):
+        mtime = datetime.fromtimestamp(os.path.getmtime(filename))
+        age_hours = (datetime.now() - mtime).total_seconds() / 3600
+        cached = _read_nonempty_csv(filename)
+        if not cached.empty and age_hours < 24.0:
+            return cached
+
+    if allow_network:
+        df = download_funding_history(symbol, days=days, save_csv=True, show_progress=False)
+        if not df.empty:
+            return df
+
+    if os.path.exists(filename):
+        cached = _read_nonempty_csv(filename)
+        if not cached.empty:
+            return cached
+    return pd.DataFrame()
 
 
 # ─── CLI запуск ──────────────────────────────────────────────

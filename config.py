@@ -6,11 +6,19 @@
 import os
 from pathlib import Path
 
+# Базовая директория проекта для единых абсолютных путей (Termux / Windows / Linux)
+BASE_DIR         = Path(__file__).resolve().parent
+DATA_DIR         = BASE_DIR / "data"
+BOT_LOG_FILE     = BASE_DIR / "bot.log"
+TRADE_LOG_FILE   = BASE_DIR / "trade.log"
+STATE_FILE       = BASE_DIR / "bot_state.json"
+CONTROL_FILE     = BASE_DIR / "bot_control.json"
+LIVE_STATUS_FILE = BASE_DIR / "bot_live_status.json"
+
 # Попытка загрузить переменные из .env файла
 try:
     from dotenv import load_dotenv
-    # Ищем .env в текущей директории или директории проекта
-    env_path = Path(__file__).resolve().parent / ".env"
+    env_path = BASE_DIR / ".env"
     load_dotenv(dotenv_path=env_path)
 except ImportError:
     pass
@@ -46,6 +54,17 @@ def _get_int(key: str, default: int) -> int:
 # =====================================================================
 # 1. РЕЖИМ ТОРГОВЛИ И КЛЮЧИ BYBIT
 # =====================================================================
+VALID_TRADING_MODES = ("DEMO", "TESTNET", "LIVE")
+
+
+def is_placeholder_key(val: str) -> bool:
+    v = (val or "").strip()
+    if not v:
+        return True
+    low = v.lower()
+    return low.startswith("your_") or low in ("changeme", "placeholder", "none", "null")
+
+
 TRADING_MODE = os.getenv("TRADING_MODE", "DEMO").strip().upper()
 
 # Ключи для ДЕМО-счета (Bybit Demo Trading)
@@ -56,22 +75,30 @@ DEMO_API_SECRET = os.getenv("DEMO_API_SECRET", "your_demo_secret").strip()
 LIVE_API_KEY    = os.getenv("LIVE_API_KEY", "your_live_key").strip()
 LIVE_API_SECRET = os.getenv("LIVE_API_SECRET", "your_live_secret").strip()
 
-# Автоматический выбор рабочего ключа
-if TRADING_MODE == "DEMO":
-    API_KEY    = DEMO_API_KEY
-    API_SECRET = DEMO_API_SECRET
-    DEMO       = True
-    TESTNET    = False
-elif TRADING_MODE == "TESTNET":
-    API_KEY    = DEMO_API_KEY
-    API_SECRET = DEMO_API_SECRET
-    DEMO       = False
-    TESTNET    = True
-else:  # LIVE
-    API_KEY    = LIVE_API_KEY
-    API_SECRET = LIVE_API_SECRET
-    DEMO       = False
-    TESTNET    = False
+
+def resolve_trading_mode(mode: str, validate_live_keys: bool = True) -> tuple[str, str, str, bool, bool]:
+    """
+    Строго валидирует торговый режим (fail-closed).
+    Исключает молчаливый переход в LIVE при опечатках вроде DEM0 / PAPER.
+    """
+    m = (mode or "").strip().upper()
+    if m not in VALID_TRADING_MODES:
+        raise ValueError(
+            f"Некорректный TRADING_MODE={mode!r}. Допустимые значения: {', '.join(VALID_TRADING_MODES)}"
+        )
+    if m == "DEMO":
+        return m, DEMO_API_KEY, DEMO_API_SECRET, True, False
+    if m == "TESTNET":
+        return m, DEMO_API_KEY, DEMO_API_SECRET, False, True
+    if validate_live_keys and (is_placeholder_key(LIVE_API_KEY) or is_placeholder_key(LIVE_API_SECRET)):
+        raise ValueError(
+            "TRADING_MODE=LIVE невозможен с плейсхолдерными или пустыми LIVE_API_KEY / LIVE_API_SECRET."
+        )
+    return m, LIVE_API_KEY, LIVE_API_SECRET, False, False
+
+
+# Строгий выбор рабочего ключа (fail-closed)
+TRADING_MODE, API_KEY, API_SECRET, DEMO, TESTNET = resolve_trading_mode(TRADING_MODE, validate_live_keys=True)
 
 
 # =====================================================================
@@ -101,9 +128,10 @@ HIGHER_INTERVAL = os.getenv("HIGHER_INTERVAL", "240").strip()  # Старший 
 # =====================================================================
 # 4. ПАРАМЕТРЫ СТРАТЕГИЙ (SUPERTREND_PRO / MA_RSI) И ФИЛЬТРЫ
 # =====================================================================
-ST_PERIOD      = _get_int("ST_PERIOD", 10)
-ST_MULTIPLIER  = _get_float("ST_MULTIPLIER", 3.0)
-ST_CONFIRM_EMA = _get_int("ST_CONFIRM_EMA", 50)
+ST_PERIOD           = _get_int("ST_PERIOD", 10)
+ST_MULTIPLIER       = _get_float("ST_MULTIPLIER", 3.0)
+ST_CONFIRM_EMA      = _get_int("ST_CONFIRM_EMA", 50)
+ST_CONFIRM_LOOKBACK = _get_int("ST_CONFIRM_LOOKBACK", 1)
 
 FAST_MA        = _get_int("FAST_MA", 20)
 SLOW_MA        = _get_int("SLOW_MA", 50)
@@ -143,7 +171,7 @@ TAKE_PROFIT_PCT     = _get_float("TAKE_PROFIT_PCT", 0.045)
 # Безубыток (Breakeven)
 USE_BREAKEVEN       = _get_bool("USE_BREAKEVEN", True)
 BREAKEVEN_TRIGGER   = _get_float("BREAKEVEN_TRIGGER", 0.015)   # Мин. % хода цены в плюс (fallback)
-BREAKEVEN_R_MULT    = _get_float("BREAKEVEN_R_MULT", 0.6)      # Перевод в БУ не ранее 0.6R (1.32x ATR) профита
+BREAKEVEN_R_MULT    = _get_float("BREAKEVEN_R_MULT", 1.1)      # Перевод в БУ при достижении 1.1R профита
 BREAKEVEN_OFFSET    = _get_float("BREAKEVEN_OFFSET", 0.002)    # +0.2% от цены входа (комиссии)
 
 
@@ -155,8 +183,8 @@ BREAKEVEN_OFFSET    = _get_float("BREAKEVEN_OFFSET", 0.002)    # +0.2% от це
 USE_TRAILING_STOP        = _get_bool("USE_TRAILING_STOP", True)
 USE_NATIVE_TRAILING_STOP = _get_bool("USE_NATIVE_TRAILING_STOP", True)  # Выставлять нативный trailingStop Bybit
 TRAILING_STOP_TRIGGER    = _get_float("TRAILING_STOP_TRIGGER", 0.015)   # Мин. % хода (fallback)
-TRAILING_STOP_R_MULT     = _get_float("TRAILING_STOP_R_MULT", 0.7)      # Активация трейлинга от 0.7R (1.54x ATR) профита
-TRAILING_STOP_ATR_MULT   = _get_float("TRAILING_STOP_ATR_MULT", 2.2)    # дистанция трейлинга в ATR
+TRAILING_STOP_R_MULT     = _get_float("TRAILING_STOP_R_MULT", 1.4)      # Активация трейлинга от 1.4R (после TP1 и БУ)
+TRAILING_STOP_ATR_MULT   = _get_float("TRAILING_STOP_ATR_MULT", 1.5)    # дистанция трейлинга в ATR
 TRAILING_STOP_FALLBACK   = _get_float("TRAILING_STOP_FALLBACK", 0.01)   # 1.0% если ATR недоступен
 
 # 6.2. Частичная фиксация прибыли (Partial TP)
@@ -186,8 +214,9 @@ MIN_ORDER_NOTIONAL      = _get_float("MIN_ORDER_NOTIONAL", 5.0)       # Мини
 # =====================================================================
 # 7. УПРАВЛЕНИЕ КАПИТАЛОМ
 # =====================================================================
-LEVERAGE              = _get_int("LEVERAGE", 5)
-MAX_OPEN_POSITIONS    = _get_int("MAX_OPEN_POSITIONS", 3)
+LEVERAGE                     = _get_int("LEVERAGE", 5)
+MAX_OPEN_POSITIONS           = _get_int("MAX_OPEN_POSITIONS", 3)
+MAX_SAME_DIRECTION_POSITIONS = _get_int("MAX_SAME_DIRECTION_POSITIONS", 2)
 POSITION_SIZE_PCT     = _get_float("POSITION_SIZE_PCT", 0.15)
 USE_RISK_BASED_SIZING = _get_bool("USE_RISK_BASED_SIZING", True)      # Расчет объема по риску от стопа
 RISK_PER_TRADE_PCT    = _get_float("RISK_PER_TRADE_PCT", 0.015)       # 1.5% риска от депозита при стопе

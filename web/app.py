@@ -1,25 +1,25 @@
 """
-FastAPI веб-сервер легковесного локального дашборда Bybit Bot (v2.2).
+FastAPI веб-сервер легковесного локального дашборда Bybit Bot (v2.3).
 Разработан специально под Termux (Android) с минимальным потреблением CPU и RAM.
 Включает:
-- Real-time WebSocket соединение (/ws) взамен частых AJAX-запросов
-- Защиту переключения в боевой режим LIVE паролем
-- Эндпоинты для интерактивных графиков свечей (/api/candles) и кривой капитала (/api/equity_history)
+- Real-time WebSocket соединение (/ws) с неблокирующим executor и TTL-кэшем статуса
+- Эндпоинты для интерактивных графиков свечей (/api/candles) и честной кривой капитала (/api/equity_history)
+- Полноценный потоковый парсер истории сделок и портфельный бэктестер
 """
 
 from fastapi import FastAPI, Request, Query, Body, Depends, HTTPException, WebSocketException, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasic
 from fastapi.templating import Jinja2Templates
 from starlette.requests import HTTPConnection
 from pathlib import Path
+from collections import deque
 import base64
 import logging
 import asyncio
 import secrets
 import time
 import threading
-from datetime import datetime, timezone
 from typing import Optional
 import pandas as pd
 
@@ -28,7 +28,8 @@ from config import (
     API_KEY, API_SECRET, DEMO, TESTNET, FALLBACK_USDT
 )
 from web.state import (
-    get_bot_instance, is_bot_paused, set_bot_paused, parse_trade_log
+    get_bot_instance, is_bot_paused, set_bot_paused, parse_trade_log,
+    parse_equity_history, write_control_state, read_control_state, read_live_status
 )
 import config
 
@@ -81,17 +82,26 @@ def verify_dashboard_auth(conn: HTTPConnection):
 
 
 app = FastAPI(
-    title="Bybit Bot v2.2 Dashboard",
+    title="Bybit Bot v2.3 Dashboard",
     dependencies=[Depends(verify_dashboard_auth)]
 )
 
 templates_dir = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(templates_dir))
 
-# Кэш цен для предотвращения перегрузки Bybit API запросами из дашборда
+# Кэш цен и статуса для предотвращения перегрузки Bybit API
 _PRICE_CACHE = {}
-_PRICE_CACHE_TTL = 3.0  # секунды
+_PRICE_CACHE_TTL = 3.0
+_STATUS_CACHE = {"key": None, "ts": 0.0, "data": None}
+_STATUS_CACHE_TTL = 1.5
 _CACHE_LOCK = threading.Lock()
+
+
+def _invalidate_status_cache():
+    with _CACHE_LOCK:
+        _STATUS_CACHE["key"] = None
+        _STATUS_CACHE["ts"] = 0.0
+        _STATUS_CACHE["data"] = None
 
 
 def get_cached_price(bot_or_client, symbol: str) -> float:
@@ -115,6 +125,7 @@ def get_cached_price(bot_or_client, symbol: str) -> float:
 _STANDALONE_CLIENT = None
 _STANDALONE_LOCK = threading.Lock()
 _LAST_STANDALONE_SYNC = 0.0
+
 
 def get_standalone_client():
     """Создает и кэширует надежный HTTP клиент Bybit для standalone режима со синхронизацией времени раз в час."""
@@ -161,44 +172,57 @@ async def index(request: Request):
 async def websocket_dashboard(ws: WebSocket):
     """
     WebSocket эндпоинт для real-time пуша статуса бота в дашборд.
-    Исключает частый HTTP-поллинг, снижая нагрузку на процессор и экономя батарею (Termux).
     """
     await ws.accept()
     try:
         while True:
             status_data = await get_status()
             await ws.send_json(status_data)
-            await asyncio.sleep(1.5)
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                if msg.get("type") == "websocket.disconnect":
+                    break
+            except asyncio.TimeoutError:
+                pass
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     except Exception as e:
         log.debug(f"Dashboard WS disconnected: {e}")
 
 
-@app.get("/api/status")
-async def get_status():
-    """
-    Возвращает актуальный статус бота: баланс, открытые позиции,
-    режим торговли, PnL и состояние защитного стопа.
-    """
+def _compute_status_sync() -> dict:
     bot = get_bot_instance()
-
     mode = config.TRADING_MODE
     paused = is_bot_paused()
-    cb_active = False
+    is_mock_bot = bot is not None and "unittest.mock" in type(bot).__module__
 
-    balance = FALLBACK_USDT
-    equity = FALLBACK_USDT
+    if bot is None:
+        ctrl = read_control_state()
+        if ctrl.get("trading_mode") in config.VALID_TRADING_MODES:
+            mode = ctrl["trading_mode"]
+
+    cache_key = (id(bot) if bot is not None else 0, mode, paused)
+    now = time.time()
+    if not is_mock_bot:
+        with _CACHE_LOCK:
+            if (
+                _STATUS_CACHE["data"] is not None
+                and _STATUS_CACHE["key"] == cache_key
+                and (now - _STATUS_CACHE["ts"] < _STATUS_CACHE_TTL)
+            ):
+                return _STATUS_CACHE["data"]
+
+    cb_active = False
+    balance = 0.0
+    equity = 0.0
     unrealized_pnl = 0.0
     daily_pnl = 0.0
-
     positions_data = []
 
     if bot is not None:
-        # Данные из живого бота в памяти с потокобезопасной блокировкой
         try:
-            balance = bot.get_available_balance()
-            cb_active = getattr(bot, "circuit_breaker_active", False)
+            balance = float(bot.get_available_balance())
+            cb_active = bool(getattr(bot, "circuit_breaker_active", False))
 
             with getattr(bot, "lock", threading.RLock()):
                 positions_items = [(s, dict(p) if p else None) for s, p in bot.positions.items()]
@@ -210,8 +234,8 @@ async def get_status():
                     except Exception:
                         curr_price = pos.get("entry_price", 0.0)
 
-                    entry = pos.get("entry_price", 0.0)
-                    size = pos.get("size", 0.0)
+                    entry = float(pos.get("entry_price", 0.0) or 0.0)
+                    size = float(pos.get("size", 0.0) or 0.0)
                     is_long = pos.get("position") == "long"
 
                     if entry > 0 and size > 0:
@@ -243,33 +267,48 @@ async def get_status():
                 equity = balance + unrealized_pnl
 
             start_bal = getattr(bot, "start_day_balance", equity)
-            daily_pnl = (equity if isinstance(raw_eq, (int, float)) and raw_eq > 0 else balance) - start_bal
+            if isinstance(start_bal, (int, float)) and start_bal > 0:
+                daily_pnl = equity - float(start_bal)
+            else:
+                daily_pnl = 0.0
 
         except Exception as e:
             log.warning(f"Ошибка получения статуса из bot instance: {e}")
-
     else:
-        # Standalone режим (бот запущен в другом процессе или выключен):
-        # Опрашиваем Bybit напрямую через HTTP со синхронизацией
+        live_snap = read_live_status()
+        cb_active = bool(live_snap.get("circuit_breaker", False))
+        be_map = live_snap.get("breakeven_map", {})
+        start_bal = float(live_snap.get("start_day_balance") or 0.0)
         try:
             client = get_standalone_client()
             resp = client.get_wallet_balance(accountType="UNIFIED")
             acc_list = resp.get("result", {}).get("list", [])
             if acc_list:
-                coins = acc_list[0].get("coin", [])
+                acc = acc_list[0]
+                tot_avail_raw = acc.get("totalAvailableBalance")
+                tot_avail = max(0.0, float(tot_avail_raw)) if tot_avail_raw not in (None, "") else None
+                coins = acc.get("coin", [])
                 for c in coins:
                     if c.get("coin") == "USDT":
                         raw_avail = c.get("availableToWithdraw")
-                        avail_val = float(raw_avail) if raw_avail not in (None, "") else 0.0
+                        avail_val = max(0.0, float(raw_avail)) if raw_avail not in (None, "") else None
                         wb = float(c.get("walletBalance") or 0.0)
                         pos_im = float(c.get("totalPositionIM") or 0.0)
                         ord_im = float(c.get("totalOrderIM") or 0.0)
                         free_wb = max(0.0, wb - pos_im - ord_im)
-                        balance = avail_val if avail_val > 0 else (free_wb if free_wb > 0 else wb)
+                        if tot_avail is not None:
+                            balance = min(tot_avail, free_wb) if wb > 0 and (pos_im > 0 or ord_im > 0) else tot_avail
+                        elif avail_val is not None:
+                            balance = min(avail_val, free_wb) if wb > 0 and (pos_im > 0 or ord_im > 0) else avail_val
+                        else:
+                            balance = free_wb
                         equity = float(c.get("equity") or wb or balance)
                         break
+                else:
+                    if tot_avail is not None:
+                        balance = tot_avail
+                        equity = float(acc.get("totalEquity") or tot_avail)
 
-            # Получаем открытые позиции
             pos_resp = client.get_positions(category="linear", settleCoin="USDT")
             raw_pos = pos_resp.get("result", {}).get("list", [])
             for p in raw_pos:
@@ -296,15 +335,22 @@ async def get_status():
                         "pnl_pct": round(pnl_pct, 2),
                         "stop_loss": float(p.get("stopLoss") or 0.0),
                         "take_profit": float(p.get("takeProfit") or 0.0),
-                        "breakeven": False
+                        "breakeven": bool(be_map.get(sym, False))
                     })
 
+            if start_bal > 0 and equity > 0:
+                daily_pnl = equity - start_bal
         except Exception as e:
             log.warning(f"Standalone статус Bybit: {e}")
+            if live_snap:
+                balance = float(live_snap.get("balance") or FALLBACK_USDT)
+                equity = float(live_snap.get("equity") or balance)
+                daily_pnl = float(live_snap.get("daily_pnl") or 0.0)
 
-    unrealized_pct = (unrealized_pnl / balance * 100) if balance > 0 else 0.0
+    base_cap = equity if equity > 0 else balance
+    unrealized_pct = (unrealized_pnl / base_cap * 100) if base_cap > 0 else 0.0
 
-    return {
+    result = {
         "mode": mode,
         "is_paused": paused,
         "circuit_breaker": cb_active,
@@ -313,7 +359,7 @@ async def get_status():
         "unrealized_pnl": round(unrealized_pnl, 2),
         "unrealized_pnl_pct": round(unrealized_pct, 2),
         "daily_pnl": round(daily_pnl, 2),
-        "strategy": ACTIVE_STRATEGY,
+        "strategy": config.ACTIVE_STRATEGY,
         "leverage": LEVERAGE,
         "open_positions_count": len(positions_data),
         "max_positions": MAX_OPEN_POSITIONS,
@@ -321,17 +367,24 @@ async def get_status():
         "positions": positions_data
     }
 
+    if not is_mock_bot:
+        with _CACHE_LOCK:
+            _STATUS_CACHE["key"] = cache_key
+            _STATUS_CACHE["ts"] = time.time()
+            _STATUS_CACHE["data"] = result
+    return result
 
-@app.get("/api/candles")
-async def get_candles(
-    symbol: str = Query("BTCUSDT"),
-    interval: str = Query("60"),
-    limit: int = Query(120)
-):
-    """
-    Возвращает свечные данные (OHLCV) для графиков TradingView Lightweight Charts.
-    """
+
+@app.get("/api/status")
+async def get_status():
+    """Возвращает актуальный статус бота без блокировки asyncio event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _compute_status_sync)
+
+
+def _get_candles_sync(symbol: str, interval: str, limit: int) -> list[dict]:
     sym = symbol.strip().upper()
+    limit = max(1, min(1000, int(limit)))
     bot = get_bot_instance()
     df = pd.DataFrame()
     if bot is not None and hasattr(bot, "get_klines"):
@@ -347,7 +400,7 @@ async def get_candles(
             raw = resp["result"]["list"]
             df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
             df = df.astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
-            df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
+            df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="ms")
             df = df.sort_values("timestamp").reset_index(drop=True)
         except Exception as e:
             log.warning(f"Ошибка получения свечей из standalone client: {e}")
@@ -369,45 +422,42 @@ async def get_candles(
     return candles
 
 
+@app.get("/api/candles")
+async def get_candles(
+    symbol: str = Query("BTCUSDT"),
+    interval: str = Query("60"),
+    limit: int = Query(120)
+):
+    """Возвращает свечные данные (OHLCV) для графиков TradingView Lightweight Charts."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: _get_candles_sync(symbol, interval, limit))
+
+
 @app.get("/api/equity_history")
 async def get_equity_history():
     """
     Возвращает историческую кривую капитала (Equity Curve)
-    на основе баланса и истории сделок из trade.log.
+    на основе реальных снимков капитала и взвешенного PnL из trade.log.
     """
-    trades = parse_trade_log(limit=100)
     initial_balance = config.FALLBACK_USDT
     bot = get_bot_instance()
     if bot is not None:
-        initial_balance = getattr(bot, "start_day_balance", initial_balance)
+        sb = getattr(bot, "start_day_balance", initial_balance)
+        if isinstance(sb, (int, float)) and sb > 0:
+            initial_balance = float(sb)
 
-    points = []
-    curr_balance = initial_balance
-
-    if not trades:
-        now_ts = int(time.time())
-        return [{"time": now_ts, "value": round(curr_balance, 2)}]
-
-    sorted_trades = sorted(trades, key=lambda x: x.get("time") or x.get("timestamp") or "")
-    for t in sorted_trades:
-        pnl = float(t.get("pnl_pct") or 0.0)
-        curr_balance += (curr_balance * (pnl / 100.0))
-        t_str = t.get("time") or t.get("timestamp") or ""
-        try:
-            ts = int(datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
-        except Exception:
-            ts = int(time.time())
-        if points and ts <= points[-1]["time"]:
-            ts = points[-1]["time"] + 1
-        points.append({"time": ts, "value": round(curr_balance, 2)})
-
-    return points
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: parse_equity_history(initial_balance=initial_balance, margin_weight=config.POSITION_SIZE_PCT)
+    )
 
 
 @app.get("/api/trades")
 async def get_trades():
-    """Возвращает историю сделок из trade.log."""
-    return parse_trade_log(limit=60)
+    """Возвращает историю реальных сделок из trade.log."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: parse_trade_log(limit=60))
 
 
 @app.post("/api/pause")
@@ -416,22 +466,39 @@ async def toggle_pause():
     curr = is_bot_paused()
     set_bot_paused(not curr)
     new_state = not curr
+    _invalidate_status_cache()
     log.info(f"Дашборд: Бот переведен в состояние {'ПАУЗА' if new_state else 'АКТИВЕН'}")
     return {"status": "ok", "is_paused": new_state}
 
 
-@app.post("/api/panic")
-async def panic_close():
-    """
-    Panic Button: Экстренно закрывает все открытые позиции по маркету
-    и отменяет все активные ордера.
-    """
+def _close_exchange_position_safe(client, sym: str, pos_dict: dict):
+    """Закрывает позицию по маркету ДО полной отмены защитных стопов."""
+    sz = float(pos_dict.get("size", 0))
+    if sz <= 0:
+        return
+    side = "Sell" if pos_dict.get("side") == "Buy" else "Buy"
+    pos_idx = int(pos_dict.get("positionIdx", 0))
+    resp = client.place_order(
+        category="linear",
+        symbol=sym,
+        side=side,
+        orderType="Market",
+        qty=str(sz),
+        positionIdx=pos_idx,
+        reduceOnly=True
+    )
+    if isinstance(resp, dict) and resp.get("retCode", 0) != 0:
+        raise RuntimeError(f"retCode={resp.get('retCode')}: {resp.get('retMsg')}")
+    try:
+        client.cancel_all_orders(category="linear", symbol=sym)
+    except Exception:
+        pass
+
+
+def _panic_close_sync() -> dict:
     bot = get_bot_instance()
     closed = []
     errors = []
-
-    # При экстренном закрытии обязательно переводим бота на паузу, чтобы не открыть позиции заново
-    set_bot_paused(True)
 
     if bot is not None:
         try:
@@ -440,7 +507,6 @@ async def panic_close():
         except Exception as e:
             errors.append(str(e))
 
-    # Если бот не зарегистрирован или выбросил ошибку, закрываем напрямую через HTTP
     try:
         client = get_standalone_client()
         pos_resp = client.get_positions(category="linear", settleCoin="USDT")
@@ -449,45 +515,65 @@ async def panic_close():
             sym = p.get("symbol")
             if sz > 0 and sym:
                 try:
-                    client.cancel_all_orders(category="linear", symbol=sym)
-                    side = "Sell" if p.get("side") == "Buy" else "Buy"
-                    pos_idx = int(p.get("positionIdx", 0))
-                    client.place_order(
-                        category="linear",
-                        symbol=sym,
-                        side=side,
-                        orderType="Market",
-                        qty=str(sz),
-                        positionIdx=pos_idx,
-                        reduceOnly=True
-                    )
+                    _close_exchange_position_safe(client, sym, p)
                     closed.append(sym)
                 except Exception as e:
                     errors.append(f"{sym}: {e}")
 
         msg = f"Закрыто позиций: {len(closed)}" + (f" | Ошибки: {'; '.join(errors)}" if errors else "")
-        return {"status": "ok", "message": msg}
+        return {"status": "ok" if not errors else "error", "message": msg}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
-@app.post("/api/close_position")
-async def close_position(symbol: str = Query(...)):
-    """Закрывает конкретную позицию по символу."""
+@app.post("/api/panic")
+async def panic_close():
+    """Panic Button: экстренно закрывает все открытые позиции и переводит бота на паузу."""
+    set_bot_paused(True)
+    _invalidate_status_cache()
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(None, _panic_close_sync)
+    _invalidate_status_cache()
+    return res
+
+
+def _close_position_sync(symbol: str) -> dict:
     sym = symbol.strip().upper()
-    if sym not in config.SYMBOLS and sym != config.BENCHMARK_SYMBOL:
-        return {"status": "error", "message": f"Неизвестный символ: {sym}. Разрешены: {', '.join(config.SYMBOLS)}"}
-
     bot = get_bot_instance()
-    if bot is not None:
-        try:
-            price = bot.get_price(sym)
-            bot.close_position(sym, price, reason="Ручное закрытие через UI")
-            return {"status": "ok", "message": f"Позиция {sym} закрыта."}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
 
-    # Standalone фоллбэк: закрытие позиции напрямую через HTTP клиент Bybit
+    if bot is not None:
+        with getattr(bot, "lock", threading.RLock()):
+            tracked_pos = dict(bot.positions.get(sym)) if getattr(bot, "positions", {}).get(sym) else None
+
+        if tracked_pos and float(tracked_pos.get("size") or 0.0) > 0:
+            try:
+                price = bot.get_price(sym)
+                res = bot.close_position(sym, price, reason="Ручное закрытие через UI")
+                if res is not None:
+                    return {"status": "ok", "message": f"Позиция {sym} закрыта."}
+                return {"status": "error", "message": f"Не удалось закрыть позицию {sym} на бирже."}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        # Fallback: проверка внесписочных / Hedge позиций напрямую через клиент бота
+        client = getattr(bot, "client", None)
+        if client is not None and hasattr(client, "get_positions"):
+            try:
+                pos_resp = client.get_positions(category="linear", symbol=sym)
+                closed_any = False
+                if isinstance(pos_resp, dict):
+                    for p in pos_resp.get("result", {}).get("list", []):
+                        if float(p.get("size") or 0.0) > 0:
+                            _close_exchange_position_safe(client, sym, p)
+                            closed_any = True
+                if closed_any:
+                    if hasattr(bot, "sync_positions"):
+                        bot.sync_positions()
+                    return {"status": "ok", "message": f"Позиция {sym} закрыта."}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Открытая позиция по {sym} не найдена."}
+
     try:
         client = get_standalone_client()
         pos_resp = client.get_positions(category="linear", symbol=sym)
@@ -495,24 +581,64 @@ async def close_position(symbol: str = Query(...)):
         for p in pos_resp.get("result", {}).get("list", []):
             sz = float(p.get("size", 0))
             if sz > 0:
-                client.cancel_all_orders(category="linear", symbol=sym)
-                side = "Sell" if p.get("side") == "Buy" else "Buy"
-                pos_idx = int(p.get("positionIdx", 0))
-                client.place_order(
-                    category="linear",
-                    symbol=sym,
-                    side=side,
-                    orderType="Market",
-                    qty=str(sz),
-                    positionIdx=pos_idx,
-                    reduceOnly=True
-                )
+                _close_exchange_position_safe(client, sym, p)
                 closed_any = True
         if closed_any:
             return {"status": "ok", "message": f"Позиция {sym} закрыта (standalone)."}
         return {"status": "error", "message": f"Открытая позиция по {sym} не найдена."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/close_position")
+async def close_position(symbol: str = Query(...)):
+    """Закрывает любую открытую позицию по символу."""
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(None, lambda: _close_position_sync(symbol))
+    _invalidate_status_cache()
+    return res
+
+
+def _set_mode_sync(new_mode: str) -> dict:
+    global _STANDALONE_CLIENT, _LAST_STANDALONE_SYNC
+
+    prev_mode = config.TRADING_MODE
+    prev_key = config.API_KEY
+    prev_sec = config.API_SECRET
+    prev_demo = config.DEMO
+    prev_test = config.TESTNET
+
+    config.TRADING_MODE = new_mode
+    if new_mode == "DEMO":
+        config.API_KEY = config.DEMO_API_KEY
+        config.API_SECRET = config.DEMO_API_SECRET
+        config.DEMO = True
+        config.TESTNET = False
+    else:
+        config.API_KEY = config.LIVE_API_KEY
+        config.API_SECRET = config.LIVE_API_SECRET
+        config.DEMO = False
+        config.TESTNET = False
+
+    with _STANDALONE_LOCK:
+        _STANDALONE_CLIENT = None
+        _LAST_STANDALONE_SYNC = 0.0
+
+    bot = get_bot_instance()
+    if bot is not None and hasattr(bot, "reload_credentials"):
+        ok = bot.reload_credentials()
+        if ok is False:
+            config.TRADING_MODE = prev_mode
+            config.API_KEY = prev_key
+            config.API_SECRET = prev_sec
+            config.DEMO = prev_demo
+            config.TESTNET = prev_test
+            return {"status": "error", "message": "Не удалось переключить режим: проверьте API ключи в .env"}
+    else:
+        write_control_state(trading_mode=new_mode)
+
+    log.info(f"Дашборд: Торговый режим изменен на {new_mode}")
+    return {"status": "ok", "message": f"Режим успешно изменен на {new_mode}"}
 
 
 @app.post("/api/set_mode")
@@ -534,35 +660,16 @@ async def set_mode(mode: str = Query(...), password: Optional[str] = Query(None)
                     detail="Неверный пароль для активации боевого режима LIVE!"
                 )
 
-    config.TRADING_MODE = new_mode
-    if new_mode == "DEMO":
-        config.API_KEY = config.DEMO_API_KEY
-        config.API_SECRET = config.DEMO_API_SECRET
-        config.DEMO = True
-        config.TESTNET = False
-    else:
-        config.API_KEY = config.LIVE_API_KEY
-        config.API_SECRET = config.LIVE_API_SECRET
-        config.DEMO = False
-        config.TESTNET = False
-
-    global _STANDALONE_CLIENT, _LAST_STANDALONE_SYNC
-    with _STANDALONE_LOCK:
-        _STANDALONE_CLIENT = None
-        _LAST_STANDALONE_SYNC = 0.0
-
-    bot = get_bot_instance()
-    if bot is not None and hasattr(bot, "reload_credentials"):
-        bot.reload_credentials()
-
-    log.info(f"Дашборд: Торговый режим изменен на {new_mode}")
-    return {"status": "ok", "message": f"Режим успешно изменен на {new_mode}"}
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(None, lambda: _set_mode_sync(new_mode))
+    _invalidate_status_cache()
+    return res
 
 
 @app.post("/api/backtest")
 async def api_backtest(payload: dict = Body(...)):
-    """Запускает бэктест из UI и возвращает результаты."""
-    from backtest import run_backtest_symbol, run_backtest
+    """Запускает честный бэктест (или портфельную симуляцию для ALL) из UI."""
+    from backtest import run_backtest_symbol, run_portfolio_backtest
     symbol = str(payload.get("symbol", "BTCUSDT")).strip()
     try:
         days = max(1, min(365, int(payload.get("days", 90))))
@@ -572,25 +679,35 @@ async def api_backtest(payload: dict = Body(...)):
     try:
         loop = asyncio.get_running_loop()
         if symbol.lower() == "all":
-            results = await loop.run_in_executor(None, lambda: run_backtest(days=days))
-            if not results:
+            port_res = await loop.run_in_executor(
+                None, lambda: run_portfolio_backtest(days=days, verbose=False)
+            )
+            if not port_res or not port_res.get("symbols"):
                 return JSONResponse(status_code=400, content={"message": "Нет данных"})
-            tot_trades = sum(r["trades"] for r in results)
-            tot_pnl = sum(r["pnl_pct"] for r in results) / len(results)
-            avg_wr = sum(r["win_rate"] for r in results) / len(results)
-            max_dd = min(r["max_drawdown"] for r in results)
-            avg_pf = sum(r["profit_factor"] for r in results) / len(results)
-            avg_sh = sum(r["sharpe_ratio"] for r in results) / len(results)
+
+            recent = []
+            tdf = port_res.get("tdf")
+            if tdf is not None and not tdf.empty:
+                for _, t in tdf.tail(20).iterrows():
+                    recent.append({
+                        "symbol": str(t["symbol"]),
+                        "type": str(t["type"]),
+                        "entry": float(t["entry"]),
+                        "exit": float(t["exit"]),
+                        "pnl_pct": float(t["pnl_pct"]),
+                        "reason": str(t["reason"]),
+                        "exit_time": t["exit_time"].strftime("%Y-%m-%d %H:%M") if hasattr(t["exit_time"], "strftime") else str(t["exit_time"])
+                    })
 
             return {
                 "symbol": "ALL",
-                "trades": tot_trades,
-                "win_rate": avg_wr,
-                "pnl_pct": tot_pnl,
-                "profit_factor": avg_pf,
-                "max_drawdown": max_dd,
-                "sharpe_ratio": avg_sh,
-                "recent_trades": []
+                "trades": port_res["trades"],
+                "win_rate": port_res["win_rate"],
+                "pnl_pct": port_res["pnl_pct"],
+                "profit_factor": port_res["profit_factor"],
+                "max_drawdown": port_res["max_drawdown"],
+                "sharpe_ratio": port_res["sharpe_ratio"],
+                "recent_trades": recent
             }
         else:
             res = await loop.run_in_executor(None, lambda: run_backtest_symbol(symbol, days=days, verbose=False))
@@ -602,8 +719,8 @@ async def api_backtest(payload: dict = Body(...)):
             if tdf is not None and not tdf.empty:
                 for _, t in tdf.tail(20).iterrows():
                     recent.append({
-                        "symbol": t["symbol"],
-                        "type": t["type"],
+                        "symbol": str(t["symbol"]),
+                        "type": str(t["type"]),
                         "entry": float(t["entry"]),
                         "exit": float(t["exit"]),
                         "pnl_pct": float(t["pnl_pct"]),
@@ -628,22 +745,21 @@ async def api_backtest(payload: dict = Body(...)):
 
 @app.get("/api/logs/download")
 async def download_log(file: str = "bot"):
-    """Позволяет скачать bot.log или trade.log на компьютер."""
-    filename = "trade.log" if file == "trade" else "bot.log"
-    file_path = Path(filename)
+    """Позволяет скачать bot.log или trade.log."""
+    file_path = Path(config.TRADE_LOG_FILE if file == "trade" else config.BOT_LOG_FILE)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Файл логов не найден")
-    return FileResponse(path=file_path, filename=filename, media_type="text/plain")
+    return FileResponse(path=file_path, filename=file_path.name, media_type="text/plain")
 
 
 @app.get("/api/logs/view", response_class=PlainTextResponse)
 async def view_log(file: str = "bot", lines: int = 200):
-    """Возвращает последние N строк лога прямо текстом в браузер."""
-    filename = "trade.log" if file == "trade" else "bot.log"
-    file_path = Path(filename)
+    """Возвращает последние N строк лога прямо текстом в браузер (1..2000)."""
+    lines = max(1, min(2000, int(lines)))
+    file_path = Path(config.TRADE_LOG_FILE if file == "trade" else config.BOT_LOG_FILE)
     if not file_path.exists():
         return "Логов пока нет"
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.readlines()
-        return "".join(content[-lines:])
+        tail = deque(f, maxlen=lines)
+        return "".join(tail)

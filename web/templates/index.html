@@ -19,7 +19,7 @@
         }
     </script>
     <!-- TradingView Lightweight Charts -->
-    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js" integrity="sha384-JZigAjwiaZtkUbA44CWkPaT3iBb/mU5pO6QOANp+OqHd4q+1+7MG1kzp2OOP9ZfP" crossorigin="anonymous"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
         .pulse-dot { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
@@ -207,7 +207,7 @@
                     <table class="w-full text-left text-xs">
                         <thead class="bg-slate-950/60 text-slate-400 uppercase text-[10px] border-b border-slate-800 sticky top-0">
                             <tr>
-                                <th class="px-3 py-2 font-semibold">Время (UTC)</th>
+                                <th class="px-3 py-2 font-semibold">Время</th>
                                 <th class="px-3 py-2 font-semibold">Пара</th>
                                 <th class="px-3 py-2 font-semibold">Событие</th>
                                 <th class="px-3 py-2 font-semibold">Цена</th>
@@ -456,13 +456,13 @@
                 stateText.innerText = "ПАУЗА";
                 stateText.className = "text-sm font-semibold text-amber-400";
                 pauseBtn.className = "px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition flex items-center gap-1.5 shadow";
-                pauseBtn.innerHTML = `<span>▶</span> <span>Возобновить</span>`;
+                pauseBtn.textContent = "▶ Возобновить";
                 dot.className = "w-3 h-3 rounded-full bg-amber-500";
             } else {
                 stateText.innerText = "АКТИВЕН";
                 stateText.className = "text-sm font-semibold text-emerald-400";
                 pauseBtn.className = "px-4 py-2 text-xs sm:text-sm font-semibold rounded-lg bg-amber-600 hover:bg-amber-500 text-white transition flex items-center gap-1.5 shadow";
-                pauseBtn.innerHTML = `<span>⏸</span> <span>Пауза</span>`;
+                pauseBtn.textContent = "⏸ Пауза";
                 dot.className = "w-3 h-3 rounded-full bg-emerald-500 pulse-dot";
             }
 
@@ -509,7 +509,13 @@
                     const currentOpts = Array.from(chartSel.options).map(o => o.value).join(",");
                     if (currentOpts !== data.symbols.join(",")) {
                         const prevVal = chartSel.value;
-                        chartSel.innerHTML = data.symbols.map(s => `<option value="${s}">${s}</option>`).join("");
+                        chartSel.replaceChildren();
+                        for (const s of data.symbols) {
+                            const opt = document.createElement("option");
+                            opt.value = String(s);
+                            opt.textContent = String(s);
+                            chartSel.appendChild(opt);
+                        }
                         if (data.symbols.includes(prevVal)) chartSel.value = prevVal;
                         loadCandleChart();
                     }
@@ -520,8 +526,17 @@
                     const currentBt = Array.from(btSel.options).map(o => o.value).join(",");
                     if (currentBt !== expectedBt) {
                         const prevBt = btSel.value;
-                        btSel.innerHTML = `<option value="ALL">Вся корзина (ALL)</option>` +
-                            data.symbols.map(s => `<option value="${s}">${s}</option>`).join("");
+                        btSel.replaceChildren();
+                        const allOpt = document.createElement("option");
+                        allOpt.value = "ALL";
+                        allOpt.textContent = "Вся корзина (ALL)";
+                        btSel.appendChild(allOpt);
+                        for (const s of data.symbols) {
+                            const opt = document.createElement("option");
+                            opt.value = String(s);
+                            opt.textContent = String(s);
+                            btSel.appendChild(opt);
+                        }
                         if (prevBt === "ALL" || data.symbols.includes(prevBt)) btSel.value = prevBt;
                     }
                 }
@@ -534,50 +549,102 @@
             updateChartPriceLines();
         }
 
+        function _makeCell(text, clsName = "") {
+            const td = document.createElement("td");
+            if (clsName) td.className = clsName;
+            td.textContent = text;
+            return td;
+        }
+
         function renderPositionsTable(positions) {
             const tbody = document.getElementById("positionsTableBody");
+            tbody.replaceChildren();
             if (!positions || positions.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="7" class="px-4 py-8 text-center text-slate-500">Нет открытых позиций</td></tr>`;
+                const tr = document.createElement("tr");
+                const td = document.createElement("td");
+                td.colSpan = 7;
+                td.className = "px-4 py-8 text-center text-slate-500";
+                td.textContent = "Нет открытых позиций";
+                tr.appendChild(td);
+                tbody.appendChild(tr);
                 return;
             }
 
-            let html = "";
             for (const p of positions) {
-                const isLong = p.side.toLowerCase() === "buy" || p.side.toLowerCase() === "long";
-                const sideBadge = isLong
-                    ? `<span class="bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 px-2 py-0.5 rounded font-bold uppercase text-[11px]">LONG</span>`
-                    : `<span class="bg-rose-500/20 text-rose-400 border border-rose-500/40 px-2 py-0.5 rounded font-bold uppercase text-[11px]">SHORT</span>`;
+                const tr = document.createElement("tr");
+                tr.className = "hover:bg-slate-850/60 transition";
 
-                const pnlSign = p.pnl >= 0 ? "+" : "";
-                const pnlColor = p.pnl >= 0 ? "text-emerald-400" : "text-rose-400";
-                const beStatus = p.breakeven ? `<span class="text-[10px] bg-slate-800 text-emerald-400 px-1.5 py-0.5 rounded ml-1">Б/У</span>` : "";
+                tr.appendChild(_makeCell(String(p.symbol || ""), "px-4 py-3 font-bold text-white"));
 
-                html += `
-                    <tr class="hover:bg-slate-850/60 transition">
-                        <td class="px-4 py-3 font-bold text-white">${p.symbol}</td>
-                        <td class="px-4 py-3">${sideBadge}</td>
-                        <td class="px-4 py-3 font-mono">${p.size}</td>
-                        <td class="px-4 py-3 font-mono">
-                            <div>${p.entry_price}</div>
-                            <div class="text-[11px] text-slate-400">Mark: ${p.mark_price}</div>
-                        </td>
-                        <td class="px-4 py-3 font-mono text-xs">
-                            <div class="text-rose-400">SL: ${p.stop_loss || "--"}${beStatus}</div>
-                            <div class="text-emerald-400">TP: ${p.take_profit || "--"}</div>
-                        </td>
-                        <td class="px-4 py-3 font-mono font-bold ${pnlColor}">
-                            <div>${pnlSign}${p.pnl.toFixed(2)} $</div>
-                            <div class="text-xs font-normal">${pnlSign}${p.pnl_pct.toFixed(2)} %</div>
-                        </td>
-                        <td class="px-4 py-3 text-right">
-                            <button onclick="closeSinglePosition('${p.symbol}')" class="px-3 py-1 bg-rose-600/20 hover:bg-rose-600 border border-rose-500/40 hover:border-transparent text-rose-300 hover:text-white rounded text-xs font-medium transition">
-                                Закрыть
-                            </button>
-                        </td>
-                    </tr>
-                `;
+                const sideTd = document.createElement("td");
+                sideTd.className = "px-4 py-3";
+                const sideSpan = document.createElement("span");
+                const isLong = String(p.side || "").toLowerCase() === "buy" || String(p.side || "").toLowerCase() === "long";
+                sideSpan.className = isLong
+                    ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 px-2 py-0.5 rounded font-bold uppercase text-[11px]"
+                    : "bg-rose-500/20 text-rose-400 border border-rose-500/40 px-2 py-0.5 rounded font-bold uppercase text-[11px]";
+                sideSpan.textContent = isLong ? "LONG" : "SHORT";
+                sideTd.appendChild(sideSpan);
+                tr.appendChild(sideTd);
+
+                tr.appendChild(_makeCell(String(p.size ?? ""), "px-4 py-3 font-mono"));
+
+                const pxTd = document.createElement("td");
+                pxTd.className = "px-4 py-3 font-mono";
+                const entryDiv = document.createElement("div");
+                entryDiv.textContent = String(p.entry_price ?? "");
+                const markDiv = document.createElement("div");
+                markDiv.className = "text-[11px] text-slate-400";
+                markDiv.textContent = `Mark: ${p.mark_price ?? ""}`;
+                pxTd.appendChild(entryDiv);
+                pxTd.appendChild(markDiv);
+                tr.appendChild(pxTd);
+
+                const slTpTd = document.createElement("td");
+                slTpTd.className = "px-4 py-3 font-mono text-xs";
+                const slDiv = document.createElement("div");
+                slDiv.className = "text-rose-400";
+                slDiv.textContent = `SL: ${p.stop_loss || "--"}`;
+                if (p.breakeven) {
+                    const beSpan = document.createElement("span");
+                    beSpan.className = "text-[10px] bg-slate-800 text-emerald-400 px-1.5 py-0.5 rounded ml-1";
+                    beSpan.textContent = "Б/У";
+                    slDiv.appendChild(beSpan);
+                }
+                const tpDiv = document.createElement("div");
+                tpDiv.className = "text-emerald-400";
+                tpDiv.textContent = `TP: ${p.take_profit || "--"}`;
+                slTpTd.appendChild(slDiv);
+                slTpTd.appendChild(tpDiv);
+                tr.appendChild(slTpTd);
+
+                const pnlVal = Number(p.pnl || 0);
+                const pnlPctVal = Number(p.pnl_pct || 0);
+                const pnlSign = pnlVal >= 0 ? "+" : "";
+                const pnlColor = pnlVal >= 0 ? "text-emerald-400" : "text-rose-400";
+                const pnlTd = document.createElement("td");
+                pnlTd.className = `px-4 py-3 font-mono font-bold ${pnlColor}`;
+                const pnlUsdDiv = document.createElement("div");
+                pnlUsdDiv.textContent = `${pnlSign}${pnlVal.toFixed(2)} $`;
+                const pnlPctDiv = document.createElement("div");
+                pnlPctDiv.className = "text-xs font-normal";
+                pnlPctDiv.textContent = `${pnlSign}${pnlPctVal.toFixed(2)} %`;
+                pnlTd.appendChild(pnlUsdDiv);
+                pnlTd.appendChild(pnlPctDiv);
+                tr.appendChild(pnlTd);
+
+                const actTd = document.createElement("td");
+                actTd.className = "px-4 py-3 text-right";
+                const closeBtn = document.createElement("button");
+                closeBtn.className = "px-3 py-1 bg-rose-600/20 hover:bg-rose-600 border border-rose-500/40 hover:border-transparent text-rose-300 hover:text-white rounded text-xs font-medium transition";
+                closeBtn.textContent = "Закрыть";
+                const symStr = String(p.symbol || "");
+                closeBtn.addEventListener("click", () => closeSinglePosition(symStr));
+                actTd.appendChild(closeBtn);
+                tr.appendChild(actTd);
+
+                tbody.appendChild(tr);
             }
-            tbody.innerHTML = html;
         }
 
         async function refreshData() {
@@ -598,30 +665,34 @@
                 if (!res.ok) return;
                 const trades = await res.json();
                 const tbody = document.getElementById("tradesTableBody");
+                tbody.replaceChildren();
 
                 if (!trades || trades.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="6" class="px-3 py-4 text-center text-slate-500">Сделок пока нет</td></tr>`;
+                    const tr = document.createElement("tr");
+                    const td = document.createElement("td");
+                    td.colSpan = 6;
+                    td.className = "px-3 py-4 text-center text-slate-500";
+                    td.textContent = "Сделок пока нет";
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
                     return;
                 }
 
-                let html = "";
                 for (const t of trades) {
                     const pnlVal = typeof t.pnl_pct === "number" ? t.pnl_pct : 0;
                     const pnlColor = pnlVal > 0 ? "text-emerald-400" : (pnlVal < 0 ? "text-rose-400" : "text-slate-400");
                     const pnlText = pnlVal !== 0 ? (pnlVal > 0 ? "+" : "") + pnlVal.toFixed(2) + "%" : (t.pnl || "--");
 
-                    html += `
-                        <tr class="hover:bg-slate-850/40">
-                            <td class="px-3 py-2 text-slate-400 font-mono">${t.time || t.timestamp || "--"}</td>
-                            <td class="px-3 py-2 font-bold text-white">${t.symbol || "--"}</td>
-                            <td class="px-3 py-2">${t.event || t.action || "--"}</td>
-                            <td class="px-3 py-2 font-mono">${t.price || "--"}</td>
-                            <td class="px-3 py-2 font-mono font-bold ${pnlColor}">${pnlText}</td>
-                            <td class="px-3 py-2 text-slate-400 truncate max-w-xs">${t.raw || t.details || ""}</td>
-                        </tr>
-                    `;
+                    const tr = document.createElement("tr");
+                    tr.className = "hover:bg-slate-850/40";
+                    tr.appendChild(_makeCell(String(t.time || t.timestamp || "--"), "px-3 py-2 text-slate-400 font-mono"));
+                    tr.appendChild(_makeCell(String(t.symbol || "--"), "px-3 py-2 font-bold text-white"));
+                    tr.appendChild(_makeCell(String(t.event || t.action || "--"), "px-3 py-2"));
+                    tr.appendChild(_makeCell(String(t.price || "--"), "px-3 py-2 font-mono"));
+                    tr.appendChild(_makeCell(String(pnlText), `px-3 py-2 font-mono font-bold ${pnlColor}`));
+                    tr.appendChild(_makeCell(String(t.raw || t.details || ""), "px-3 py-2 text-slate-400 truncate max-w-xs"));
+                    tbody.appendChild(tr);
                 }
-                tbody.innerHTML = html;
             } catch (err) {
                 console.error("Ошибка загрузки логов:", err);
             }
@@ -687,7 +758,7 @@
         async function closeSinglePosition(symbol) {
             if (!confirm(`Закрыть позицию по ${symbol} по рынку?`)) return;
             try {
-                const res = await fetch(`/api/close_position?symbol=${symbol}`, { method: "POST" });
+                const res = await fetch(`/api/close_position?symbol=${encodeURIComponent(symbol)}`, { method: "POST" });
                 const d = await res.json();
                 alert(d.message || "Позиция закрыта");
                 refreshData();
@@ -762,7 +833,7 @@
             const sym = document.getElementById("chartSymbolSelect").value;
             const tf = document.getElementById("chartIntervalSelect").value;
             try {
-                const res = await fetch(`/api/candles?symbol=${sym}&interval=${tf}&limit=120`);
+                const res = await fetch(`/api/candles?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(tf)}&limit=120`);
                 if (res.ok) {
                     const data = await res.json();
                     if (data && data.length > 0) {
@@ -872,27 +943,32 @@
                 document.getElementById("btResTrades").innerText = data.trades;
 
                 const tbody = document.getElementById("btTradesTableBody");
-                let html = "";
+                tbody.replaceChildren();
                 if (data.recent_trades && data.recent_trades.length > 0) {
+                    const fmtP = (v) => (v < 1 ? v.toFixed(6) : (v < 100 ? v.toFixed(4) : v.toFixed(2)));
                     for (const t of data.recent_trades) {
-                        const pnlColor = t.pnl_pct >= 0 ? "text-emerald-400" : "text-rose-400";
-                        const fmtP = (v) => (v < 1 ? v.toFixed(6) : (v < 100 ? v.toFixed(4) : v.toFixed(2)));
-                        html += `
-                            <tr class="hover:bg-slate-800/40">
-                                <td class="px-3 py-2 font-bold text-white">${t.symbol}</td>
-                                <td class="px-3 py-2 uppercase font-semibold text-slate-300">${t.type}</td>
-                                <td class="px-3 py-2 font-mono">${fmtP(t.entry)}</td>
-                                <td class="px-3 py-2 font-mono">${fmtP(t.exit)}</td>
-                                <td class="px-3 py-2 font-mono font-bold ${pnlColor}">${t.pnl_pct >= 0 ? "+" : ""}${t.pnl_pct.toFixed(2)}%</td>
-                                <td class="px-3 py-2 text-slate-400">${t.reason}</td>
-                                <td class="px-3 py-2 font-mono text-slate-400 text-[11px]">${t.exit_time || ""}</td>
-                            </tr>
-                        `;
+                        const pnlVal = Number(t.pnl_pct || 0);
+                        const pnlColor = pnlVal >= 0 ? "text-emerald-400" : "text-rose-400";
+                        const tr = document.createElement("tr");
+                        tr.className = "hover:bg-slate-800/40";
+                        tr.appendChild(_makeCell(String(t.symbol || ""), "px-3 py-2 font-bold text-white"));
+                        tr.appendChild(_makeCell(String(t.type || ""), "px-3 py-2 uppercase font-semibold text-slate-300"));
+                        tr.appendChild(_makeCell(fmtP(Number(t.entry || 0)), "px-3 py-2 font-mono"));
+                        tr.appendChild(_makeCell(fmtP(Number(t.exit || 0)), "px-3 py-2 font-mono"));
+                        tr.appendChild(_makeCell(`${pnlVal >= 0 ? "+" : ""}${pnlVal.toFixed(2)}%`, `px-3 py-2 font-mono font-bold ${pnlColor}`));
+                        tr.appendChild(_makeCell(String(t.reason || ""), "px-3 py-2 text-slate-400"));
+                        tr.appendChild(_makeCell(String(t.exit_time || ""), "px-3 py-2 font-mono text-slate-400 text-[11px]"));
+                        tbody.appendChild(tr);
                     }
                 } else {
-                    html = `<tr><td colspan="7" class="px-3 py-4 text-center text-slate-500">Сделок нет</td></tr>`;
+                    const tr = document.createElement("tr");
+                    const td = document.createElement("td");
+                    td.colSpan = 7;
+                    td.className = "px-3 py-4 text-center text-slate-500";
+                    td.textContent = "Сделок нет";
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
                 }
-                tbody.innerHTML = html;
 
             } catch (err) {
                 alert("Ошибка бэктеста: " + err.message);

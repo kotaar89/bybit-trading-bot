@@ -39,6 +39,7 @@ class DonchianBreakoutStrategy(BaseStrategy):
         df = df.copy()
         if len(df) < max(self.lookback_period, self.vol_sma_period) + 5:
             df["signal"] = 0
+            df["exit_signal"] = 0
             df["ATR"] = 0.0
             return df
 
@@ -52,9 +53,16 @@ class DonchianBreakoutStrategy(BaseStrategy):
         df["VOL_SMA"] = self.calc_sma(df["volume"], self.vol_sma_period)
 
         df["signal"] = 0
+        df["exit_signal"] = 0
 
-        long_breakout = df["close"] > df["Donchian_upper"]
-        short_breakout = df["close"] < df["Donchian_lower"]
+        # Edge-trigger: сигнал только в момент первичного пробоя канала, без перезахода на каждом баре
+        raw_long = df["close"] > df["Donchian_upper"]
+        raw_short = df["close"] < df["Donchian_lower"]
+        long_breakout = raw_long & (~raw_long.shift(1, fill_value=False))
+        short_breakout = raw_short & (~raw_short.shift(1, fill_value=False))
+
+        df.loc[long_breakout, "exit_signal"] = 1
+        df.loc[short_breakout, "exit_signal"] = -1
 
         if self.volume_filter:
             vol_ok = df["volume"] >= (df["VOL_SMA"] * self.vol_threshold_mult)

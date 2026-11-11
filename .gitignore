@@ -22,4 +22,6 @@ test.py
 
 .gemini/
 bot_state.json
+bot_control.json
+bot_live_status.json
 

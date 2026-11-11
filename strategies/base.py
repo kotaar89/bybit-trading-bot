@@ -45,11 +45,14 @@ class BaseStrategy(ABC):
     def apply_mtf_filter_to_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Фильтрует колонку 'signal' по старшему тренду, если в df присутствует колонка 'HTF_EMA'.
+        Сравнивает цену закрытия старшей свечи ('HTF_CLOSE', как в live get_mtf_trend) с 'HTF_EMA'.
         """
         if getattr(self, "use_mtf_filter", False) and "HTF_EMA" in df.columns and "signal" in df.columns:
-            valid_htf = df["HTF_EMA"].notna()
-            df.loc[valid_htf & (df["signal"] == 1) & (df["close"] <= df["HTF_EMA"]), "signal"] = 0
-            df.loc[valid_htf & (df["signal"] == -1) & (df["close"] >= df["HTF_EMA"]), "signal"] = 0
+            htf_ref = df["HTF_CLOSE"] if "HTF_CLOSE" in df.columns else df["close"]
+            valid_htf = df["HTF_EMA"].notna() & htf_ref.notna()
+            df.loc[~valid_htf, "signal"] = 0
+            df.loc[valid_htf & (df["signal"] == 1) & (htf_ref <= df["HTF_EMA"]), "signal"] = 0
+            df.loc[valid_htf & (df["signal"] == -1) & (htf_ref >= df["HTF_EMA"]), "signal"] = 0
         return df
 
     @abstractmethod
@@ -169,7 +172,7 @@ class BaseStrategy(ABC):
 
         di_sum = (plus_di + minus_di).replace(0, np.nan)
         dx = 100 * (plus_di - minus_di).abs() / di_sum
-        adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(20.0)
+        adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(0.0)
         return adx
 
     @staticmethod

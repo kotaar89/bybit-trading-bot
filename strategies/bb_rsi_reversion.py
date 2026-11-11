@@ -15,6 +15,8 @@ class BbRsiReversionStrategy(BaseStrategy):
     Вход в Short: цена касается или пробивает верхнюю полосу Боллинджера при перекупленности RSI (>= 65).
     """
 
+    supports_mtf_filter: bool = False
+
     def __init__(
         self,
         bb_period: int = 20,
@@ -41,6 +43,7 @@ class BbRsiReversionStrategy(BaseStrategy):
         df = df.copy()
         if len(df) < self.bb_period + 5:
             df["signal"] = 0
+            df["exit_signal"] = 0
             df["ATR"] = 0.0
             return df
 
@@ -53,12 +56,15 @@ class BbRsiReversionStrategy(BaseStrategy):
         df["ATR"] = self.calc_atr(df, self.atr_period)
 
         df["signal"] = 0
+        df["exit_signal"] = 0
 
         # Условие отскока от нижней полосы Боллинджера (Long Reversion)
         long_cond = (df["low"] <= df["BB_lower"]) & (df["RSI"] <= self.rsi_oversold) & (df["close"] > df["open"])
         # Условие отскока от верхней полосы Боллинджера (Short Reversion)
         short_cond = (df["high"] >= df["BB_upper"]) & (df["RSI"] >= self.rsi_overbought) & (df["close"] < df["open"])
 
+        df.loc[long_cond, "exit_signal"] = 1
+        df.loc[short_cond, "exit_signal"] = -1
         df.loc[long_cond, "signal"] = 1
         df.loc[short_cond, "signal"] = -1
         return self.apply_mtf_filter_to_df(df)
