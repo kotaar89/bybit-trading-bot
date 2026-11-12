@@ -53,9 +53,13 @@ class TestV2Architecture(unittest.TestCase):
         self._tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmpdir.cleanup)
         self._ipc_patches = [
+            patch.object(config, "DB_FILE", Path(self._tmpdir.name) / "bot_data.db"),
+            patch.object(config, "PROFILES_FILE", Path(self._tmpdir.name) / "strategy_profiles.json"),
             patch.object(config, "STATE_FILE", Path(self._tmpdir.name) / "bot_state.json"),
             patch.object(config, "CONTROL_FILE", Path(self._tmpdir.name) / "bot_control.json"),
             patch.object(config, "LIVE_STATUS_FILE", Path(self._tmpdir.name) / "bot_live_status.json"),
+            patch.object(config, "TRADE_LOG_FILE", Path(self._tmpdir.name) / "trade.log"),
+            patch.object(config, "BOT_LOG_FILE", Path(self._tmpdir.name) / "bot.log"),
         ]
         for p in self._ipc_patches:
             p.start()
@@ -341,7 +345,7 @@ class TestV2Architecture(unittest.TestCase):
         from bot import BybitMultiFuturesBot
         bot = object.__new__(BybitMultiFuturesBot)
         bot.lock = threading.RLock()
-        bot.state_file = Path("test_bot_state.json")
+        bot.state_file = Path(self._tmpdir.name) / "test_bot_state.json"
         bot.risk_states = {
             "SOLUSDT": PositionRiskState(
                 symbol="SOLUSDT", side="Buy", entry_price=150.0, size=2.0, initial_size=2.0,
@@ -370,7 +374,7 @@ class TestV2Architecture(unittest.TestCase):
         from bot import BybitMultiFuturesBot
         bot = object.__new__(BybitMultiFuturesBot)
         bot.lock = threading.RLock()
-        bot.state_file = Path("test_ws_state.json")
+        bot.state_file = Path(self._tmpdir.name) / "test_ws_state.json"
         bot.save_state = MagicMock()
         bot.round_price = lambda sym, p: round(p, 2)
         bot.get_position_idx = lambda sym, side: 0
@@ -775,11 +779,15 @@ class TestV23AuditFixes(unittest.TestCase):
         self.addCleanup(self.tmpdir.cleanup)
         self.addCleanup(self._restore_globals)
 
-        # Заглушки на файловые IPC/state-пути, чтобы тесты не мусорили в рабочем каталоге
+        # Заглушки на файловые IPC/state/DB-пути, чтобы тесты не мусорили в рабочем каталоге и не читали боевую БД
         self._patches = [
+            patch.object(config, "DB_FILE", Path(self.tmpdir.name) / "bot_data.db"),
+            patch.object(config, "PROFILES_FILE", Path(self.tmpdir.name) / "strategy_profiles.json"),
             patch.object(config, "STATE_FILE", Path(self.tmpdir.name) / "bot_state.json"),
             patch.object(config, "CONTROL_FILE", Path(self.tmpdir.name) / "bot_control.json"),
             patch.object(config, "LIVE_STATUS_FILE", Path(self.tmpdir.name) / "bot_live_status.json"),
+            patch.object(config, "TRADE_LOG_FILE", Path(self.tmpdir.name) / "trade.log"),
+            patch.object(config, "BOT_LOG_FILE", Path(self.tmpdir.name) / "bot.log"),
         ]
         for p in self._patches:
             p.start()

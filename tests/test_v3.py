@@ -1442,12 +1442,51 @@ class TestV3AuditRegressionFixes(unittest.TestCase):
             self.assertLessEqual(len(sub_args), 10)
 
     def test_gitignore_covers_sqlite_and_profiles_and_clean_repo_root(self):
+        import subprocess
         root = Path(config.BASE_DIR)
         gi = (root / ".gitignore").read_text(encoding="utf-8")
-        for pat in ("*.db", "*.db-wal", "*.db-shm", "bot_data.db*", "strategy_profiles.json"):
+        for pat in ("*.db", "*.db-wal", "*.db-shm", "bot_data.db*", "strategy_profiles.json", "bot_state.json", "bot_control.json", "bot_live_status.json"):
             self.assertIn(pat, gi)
-        for forbidden in ("bot_data.db", "bot_data.db-wal", "bot_data.db-shm", "strategy_profiles.json"):
-            self.assertFalse((root / forbidden).exists(), f"Unexpected artifact in repo root: {forbidden}")
+
+        # Проверяем, что ни один runtime-артефакт не отслеживается git и корректно игнорируется
+        runtime_artifacts = [
+            "bot_data.db",
+            "bot_data.db-wal",
+            "bot_data.db-shm",
+            "strategy_profiles.json",
+            "bot_state.json",
+            "bot_control.json",
+            "bot_live_status.json",
+        ]
+        if (root / ".git").exists():
+            tracked = subprocess.run(
+                ["git", "ls-files", "--", *runtime_artifacts],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(tracked.stdout.strip(), "", f"Runtime artifacts must not be tracked by git: {tracked.stdout}")
+            for art in ("bot_data.db", "bot_data.db-wal", "bot_data.db-shm", "strategy_profiles.json"):
+                ignored = subprocess.run(
+                    ["git", "check-ignore", "-q", art],
+                    cwd=str(root),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(ignored.returncode, 0, f"{art} must be ignored by .gitignore")
+
+        # Убеждаемся, что пути внутри теста изолированы и запись в БД/профиль не затрагивает корень проекта
+        root_db = root / "bot_data.db"
+        before_mtime = root_db.stat().st_mtime_ns if root_db.exists() else None
+        db = BotDatabase()
+        db.set_runtime_value("isolation_check", {"ok": True})
+        self.assertEqual(Path(config.DB_FILE).resolve(), self.db_path.resolve())
+        if before_mtime is None:
+            self.assertFalse(root_db.exists())
+        else:
+            self.assertEqual(root_db.stat().st_mtime_ns, before_mtime)
 
     def test_shadow_runtime_meta_ticker_no_double_tick_and_ipc_timestamp_tie(self):
         db = BotDatabase(self.db_path)

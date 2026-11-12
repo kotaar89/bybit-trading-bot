@@ -2160,6 +2160,7 @@ class BybitMultiFuturesBot:
                                 r_mult=PARTIAL_TP_R_MULT,
                                 position_idx=new_pos.get("position_idx", 0)
                             )
+                            self.breakeven_applied[sym] = False
                         self.save_state()
                     elif old_pos and new_pos:
                         cur_risk = self.risk_states.get(sym)
